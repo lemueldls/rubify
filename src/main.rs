@@ -12,9 +12,9 @@ struct Cli {
     /// Output font file path
     output: PathBuf,
 
-    /// Optional font file to use for pinyin characters
+    /// Optional font file to use for ruby characters
     #[arg(long)]
-    pinyin_font: Option<PathBuf>,
+    ruby_font: Option<PathBuf>,
 
     /// Subset the font to include only CJK and Pinyin characters
     #[arg(long)]
@@ -27,21 +27,18 @@ fn main() -> Result<()> {
     let font_data = fs::read(&cli.input)
         .with_context(|| format!("Failed to read input file: {:?}", cli.input))?;
 
-    let pinyin_font_data = if let Some(path) = &cli.pinyin_font {
-        Some(
-            fs::read(path)
-                .with_context(|| format!("Failed to read pinyin font file: {:?}", path))?,
-        )
+    let ruby_font_data = if let Some(path) = &cli.ruby_font {
+        Some(fs::read(path).with_context(|| format!("Failed to read ruby font file: {:?}", path))?)
     } else {
         None
     };
 
     println!("Processing font...");
-    let mut new_font_data = pinyinify::process_font_file(&font_data, pinyin_font_data.as_deref())?;
+    let mut new_font_data = rubify::process_font_file(&font_data, ruby_font_data.as_deref())?;
 
     if cli.subset {
         println!("Subsetting font...");
-        new_font_data = pinyinify::subset_cjk(&new_font_data)?;
+        new_font_data = rubify::subset_cjk(&new_font_data)?;
     }
 
     // Infer format from output extension
@@ -53,7 +50,7 @@ fn main() -> Result<()> {
 
     if let Some("woff2") = extension.as_deref() {
         println!("Converting to WOFF2...");
-        new_font_data = pinyinify::convert_to_woff2(&new_font_data)?;
+        new_font_data = rubify::convert_to_woff2(&new_font_data)?;
     }
 
     fs::write(&cli.output, new_font_data)

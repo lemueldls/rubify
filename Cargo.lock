@@ -393,25 +393,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
 
 [[package]]
-name = "pinyinify"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "font-types",
- "fontcull",
- "fontcull-font-types",
- "fontcull-klippa",
- "fontcull-read-fonts",
- "kurbo",
- "pinyin",
- "read-fonts",
- "skrifa",
- "woofwoof",
- "write-fonts",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -467,6 +448,25 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "rubify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "font-types",
+ "fontcull",
+ "fontcull-font-types",
+ "fontcull-klippa",
+ "fontcull-read-fonts",
+ "kurbo",
+ "pinyin",
+ "read-fonts",
+ "skrifa",
+ "woofwoof",
+ "write-fonts",
+]
 
 [[package]]
 name = "shlex"

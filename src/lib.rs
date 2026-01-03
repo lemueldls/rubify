@@ -5,12 +5,14 @@ use fontcull_klippa::{Plan, SubsetFlags, subset_font};
 // Imports for subsetting and woff2
 use fontcull_read_fonts as frf;
 use fontcull_read_fonts::collections::int_set::IntSet;
-use kurbo::{Affine, BezPath, Shape};
-use pinyin::ToPinyin;
+use kurbo::BezPath;
 use read_fonts::{
     FileRef, FontRef, TableProvider,
     types::{GlyphId, Tag},
 };
+
+#[cfg(feature = "pinyin")]
+mod ruby;
 use skrifa::{MetadataProvider, outline::OutlinePen};
 use woofwoof;
 use write_fonts::{
@@ -32,12 +34,12 @@ const TAG_GLYF: Tag = Tag::new(b"glyf");
 const TAG_LOCA: Tag = Tag::new(b"loca");
 const TAG_HEAD: Tag = Tag::new(b"head");
 
-struct PathPen {
-    path: BezPath,
+pub struct PathPen {
+    pub path: BezPath,
 }
 
 impl PathPen {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             path: BezPath::new(),
         }
@@ -105,7 +107,7 @@ pub fn process_font_file(font_data: &[u8], pinyin_font_data: Option<&[u8]>) -> R
     process_single_font(font_ref, pinyin_font_ref)
 }
 
-fn process_single_font(font: FontRef, pinyin_font: Option<FontRef>) -> Result<Vec<u8>> {
+fn process_single_font(font: FontRef, _pinyin_font: Option<FontRef>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx().context("Missing hmtx")?;
@@ -114,17 +116,20 @@ fn process_single_font(font: FontRef, pinyin_font: Option<FontRef>) -> Result<Ve
     let num_glyphs = maxp.num_glyphs();
     let upem = font.head()?.units_per_em() as f64;
 
-    // Providers for pinyin (default to main font)
-    let p_font_ref = pinyin_font.as_ref().unwrap_or(&font);
-    let p_charmap = p_font_ref.charmap();
-    let p_outlines = p_font_ref.outline_glyphs();
-    let p_hmtx = p_font_ref.hmtx().context("Missing pinyin font hmtx")?;
-    let p_upem = p_font_ref.head()?.units_per_em() as f64;
-
-    // Normalizing scale factor:
-    // We want pinyin to be 30% of main font's EM height.
-    // Scale = (0.3 * MainUPEM) / PinyinUPEM
-    let p_scale_factor = (0.3 * upem) / p_upem;
+    #[cfg(feature = "pinyin")]
+    let ruby_renderer: Option<Box<dyn crate::ruby::RubyRenderer>> = {
+        if let Some(pf) = _pinyin_font.as_ref() {
+            match crate::ruby::pinyin::PinyinRenderer::new(pf.clone(), 0.3, upem) {
+                Ok(r) => Some(Box::new(r)),
+                Err(err) => {
+                    eprintln!("Warning: failed to initialize pinyin renderer: {:?}", err);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
 
     let mut gid_to_char: HashMap<GlyphId, char> = HashMap::new();
 
@@ -160,90 +165,14 @@ fn process_single_font(font: FontRef, pinyin_font: Option<FontRef>) -> Result<Ve
         }
 
         if let Some(&ch) = gid_to_char.get(&gid) {
-            if let Some(p) = ch.to_pinyin() {
-                let pinyin_text = p.with_tone();
-                let mut pinyin_paths: Vec<(skrifa::GlyphId, BezPath)> = Vec::new();
-                let mut all_found = true;
-
-                for pc in pinyin_text.chars() {
-                    match p_charmap.map(pc) {
-                        Some(pgid) if pgid.to_u32() != 0 => {
-                            if let Some(pglyph) = p_outlines.get(pgid) {
-                                let mut ppen = PathPen::new();
-
-                                if pglyph
-                                    .draw(skrifa::instance::Size::unscaled(), &mut ppen)
-                                    .is_ok()
-                                {
-                                    pinyin_paths.push((pgid, ppen.path));
-                                } else {
-                                    all_found = false;
-
-                                    break;
-                                }
-                            } else {
-                                all_found = false;
-
-                                break;
-                            }
-                        }
-                        _ => {
-                            all_found = false;
-
-                            break;
-                        }
-                    }
-                }
-
-                if all_found && !pinyin_paths.is_empty() {
-                    let orig_advance = hmtx
-                        .h_metrics()
-                        .get(gid.to_u32() as usize)
-                        .map(|m| m.advance.get())
-                        .unwrap_or(upem as u16) as f64;
-
-                    let mut total_pinyin_width = 0.0;
-
-                    for (pgid, _) in &pinyin_paths {
-                        let adv = p_hmtx
-                            .h_metrics()
-                            .get(pgid.to_u32() as usize)
-                            .map(|m| m.advance.get())
-                            .unwrap_or(p_upem as u16) as f64;
-
-                        total_pinyin_width += adv * p_scale_factor;
-                    }
-
-                    let bbox = final_path.bounding_box();
-                    let target_y = bbox.y1 + (upem * 0.1); // 10% EM padding
-                    let mut current_x = (orig_advance - total_pinyin_width) / 2.0;
-
-                    for (pgid, mut p_path) in pinyin_paths {
-                        let adv = p_hmtx
-                            .h_metrics()
-                            .get(pgid.to_u32() as usize)
-                            .map(|m| m.advance.get())
-                            .unwrap_or(p_upem as u16) as f64;
-                        let xform = Affine::translate((current_x, target_y))
-                            * Affine::scale(p_scale_factor);
-
-                        p_path.apply_affine(xform);
-
-                        for el in p_path.elements() {
-                            match el {
-                                kurbo::PathEl::MoveTo(p) => final_path.move_to(*p),
-                                kurbo::PathEl::LineTo(p) => final_path.line_to(*p),
-                                kurbo::PathEl::QuadTo(p1, p2) => final_path.quad_to(*p1, *p2),
-                                kurbo::PathEl::CurveTo(p1, p2, p3) => {
-                                    final_path.curve_to(*p1, *p2, *p3)
-                                }
-                                kurbo::PathEl::ClosePath => final_path.close_path(),
-                            }
-                        }
-
-                        current_x += adv * p_scale_factor;
-                    }
-                }
+            #[cfg(feature = "pinyin")]
+            if let Some(renderer) = &ruby_renderer {
+                let orig_advance = hmtx
+                    .h_metrics()
+                    .get(gid.to_u32() as usize)
+                    .map(|m| m.advance.get())
+                    .unwrap_or(upem as u16) as f64;
+                let _ = renderer.annotate(ch, &mut final_path, orig_advance, upem);
             }
         }
 

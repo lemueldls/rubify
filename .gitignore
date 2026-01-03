@@ -1,1 +1,6 @@
 /target
+
+*.ttf
+*.ttc
+*.otf
+*.woff2
