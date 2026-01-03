@@ -1,23 +1,15 @@
-use clap::{Parser, ValueEnum};
-use std::fs;
-use std::path::PathBuf;
-use anyhow::{Context, Result};
+use std::{fs, path::PathBuf};
 
-#[derive(Clone, ValueEnum, Debug)]
-enum Format {
-    Ttf,
-    Woff2,
-}
+use anyhow::{Context, Result};
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Input font file path
-    #[arg(short, long)]
     input: PathBuf,
 
     /// Output font file path
-    #[arg(short, long)]
     output: PathBuf,
 
     /// Optional font file to use for pinyin characters
@@ -27,10 +19,6 @@ struct Cli {
     /// Subset the font to include only CJK and Pinyin characters
     #[arg(long)]
     subset: bool,
-
-    /// Output format
-    #[arg(long, value_enum, default_value_t = Format::Ttf)]
-    format: Format,
 }
 
 fn main() -> Result<()> {
@@ -40,7 +28,10 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to read input file: {:?}", cli.input))?;
 
     let pinyin_font_data = if let Some(path) = &cli.pinyin_font {
-        Some(fs::read(path).with_context(|| format!("Failed to read pinyin font file: {:?}", path))?)
+        Some(
+            fs::read(path)
+                .with_context(|| format!("Failed to read pinyin font file: {:?}", path))?,
+        )
     } else {
         None
     };
@@ -53,12 +44,16 @@ fn main() -> Result<()> {
         new_font_data = pinyinify::subset_cjk(&new_font_data)?;
     }
 
-    match cli.format {
-        Format::Woff2 => {
-            println!("Converting to WOFF2...");
-            new_font_data = pinyinify::convert_to_woff2(&new_font_data)?;
-        },
-        Format::Ttf => {}
+    // Infer format from output extension
+    let extension = cli
+        .output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase());
+
+    if let Some("woff2") = extension.as_deref() {
+        println!("Converting to WOFF2...");
+        new_font_data = pinyinify::convert_to_woff2(&new_font_data)?;
     }
 
     fs::write(&cli.output, new_font_data)
