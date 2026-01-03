@@ -60,17 +60,25 @@ struct Cli {
     #[arg(long, default_value_t = 0.3)]
     scale: f64,
 
-    /// Gutter (in em) between base glyph and ruby text.
-    #[arg(long, default_value_t = 0.1)]
+    /// Gutter (in em) between base glyph and ruby text. Default: 0.05
+    #[arg(long, default_value_t = 0.0)]
     gutter: f64,
 
     /// Delimiter string to split ruby text into parts (must be single character)
     #[arg(long)]
     delimiter: Option<String>,
 
-    /// Spacing (in em) to insert between parts when delimiter is used.
+    /// Spacing (in em) to insert between parts when delimiter is used. Default: 0.0
     #[arg(long, default_value_t = 0.0)]
     spacing: f64,
+
+    /// When set, use tight per-character placement (legacy behavior). By default we use a consistent baseline.
+    #[arg(long)]
+    tight: bool,
+
+    /// Fine-tune baseline offset (in em units). Positive moves annotation further away from base glyph.
+    #[arg(long, default_value_t = 0.0)]
+    baseline_offset: f64,
 
     /// Subset the font to include only CJK and Pinyin characters
     #[arg(long)]
@@ -141,6 +149,8 @@ fn main() -> Result<()> {
                 delimiter_char,
                 cli.spacing,
                 position,
+                cli.baseline_offset,
+                cli.tight,
             )?;
 
             result.push(renderer);

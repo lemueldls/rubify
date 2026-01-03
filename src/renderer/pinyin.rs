@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use ::pinyin::ToPinyin;
 use anyhow::{Context, Result};
 use kurbo::{Affine, BezPath, Shape};
@@ -22,6 +24,14 @@ pub struct PinyinRenderer<'a> {
     spacing_em: f64,
     /// position of the ruby relative to the base glyph
     position: RubyPosition,
+    /// baseline offset in em units to fine tune annotation baseline
+    baseline_offset_em: f64,
+    /// when true, use legacy tight placement; otherwise a consistent baseline is used
+    tight: bool,
+    /// cached consistent top target y (in main font units), computed lazily when placing Top annotations
+    cached_top_target: Mutex<Option<f64>>,
+    /// cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
+    cached_bottom_target: Mutex<Option<f64>>,
 }
 
 impl<'a> PinyinRenderer<'a> {
@@ -32,6 +42,8 @@ impl<'a> PinyinRenderer<'a> {
         delimiter: Option<char>,
         spacing_em: f64,
         position: RubyPosition,
+        baseline_offset_em: f64,
+        tight: bool,
     ) -> Result<Self> {
         let upem = font.head()?.units_per_em() as f64;
 
@@ -43,6 +55,10 @@ impl<'a> PinyinRenderer<'a> {
             delimiter,
             spacing_em,
             position,
+            baseline_offset_em,
+            tight,
+            cached_top_target: Mutex::new(None),
+            cached_bottom_target: Mutex::new(None),
         })
     }
 }
@@ -149,10 +165,87 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
                 match self.position {
                     RubyPosition::Top | RubyPosition::Bottom => {
                         // gutter is in ems; position y above or below the glyph bbox
-                        let target_y = if self.position == RubyPosition::Top {
-                            bbox.y1 + gutter_units
+                        // To produce a consistent baseline across characters, we compute
+                        // a required target that ensures the bottom/top of the scaled
+                        // pinyin paths stays above/below the base glyph bbox, and then
+                        // optionally cache a consistent target across characters.
+                        let baseline_offset_units = self.baseline_offset_em * main_upem;
+
+                        // Measure min/max y of the pinyin glyphs in unscaled font units
+                        let mut min_y: f64 = f64::INFINITY;
+                        let mut max_y: f64 = f64::NEG_INFINITY;
+
+                        for part_paths in &parts_paths {
+                            for (_pgid, p_path) in part_paths {
+                                for el in p_path.elements() {
+                                    match el {
+                                        kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => {
+                                            min_y = min_y.min(p.y);
+                                            max_y = max_y.max(p.y);
+                                        }
+                                        kurbo::PathEl::QuadTo(p1, p2) => {
+                                            min_y = min_y.min(p1.y).min(p2.y);
+                                            max_y = max_y.max(p1.y).max(p2.y);
+                                        }
+                                        kurbo::PathEl::CurveTo(p1, p2, p3) => {
+                                            min_y = min_y.min(p1.y).min(p2.y).min(p3.y);
+                                            max_y = max_y.max(p1.y).max(p2.y).max(p3.y);
+                                        }
+                                        kurbo::PathEl::ClosePath => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if !min_y.is_finite() {
+                            // fallback to 0
+                            min_y = 0.0;
+                        }
+                        if !max_y.is_finite() {
+                            max_y = approx_height / p_scale_factor;
+                        }
+
+                        // scaled extents
+                        let min_y_scaled = min_y * p_scale_factor;
+                        let max_y_scaled = max_y * p_scale_factor;
+
+                        // required target values that ensure pinyin does not overlap base glyph
+                        let required_top_target =
+                            bbox.y1 + gutter_units + baseline_offset_units - min_y_scaled;
+                        let required_bottom_target =
+                            bbox.y0 - gutter_units - baseline_offset_units - max_y_scaled;
+
+                        let target_y = if self.tight {
+                            // legacy per-character behavior: basing on bbox directly
+                            if self.position == RubyPosition::Top {
+                                bbox.y1 + gutter_units
+                            } else {
+                                bbox.y0 - gutter_units - approx_height
+                            }
                         } else {
-                            bbox.y0 - gutter_units - approx_height
+                            // consistent baseline behavior: cache a target across characters
+                            if self.position == RubyPosition::Top {
+                                let mut cached = self.cached_top_target.lock().unwrap();
+                                if let Some(prev) = *cached {
+                                    let newv = prev.max(required_top_target);
+                                    *cached = Some(newv);
+                                    newv
+                                } else {
+                                    *cached = Some(required_top_target);
+                                    required_top_target
+                                }
+                            } else {
+                                let mut cached = self.cached_bottom_target.lock().unwrap();
+                                if let Some(prev) = *cached {
+                                    // choose the minimum (more negative) to ensure we clear tall glyphs
+                                    let newv = prev.min(required_bottom_target);
+                                    *cached = Some(newv);
+                                    newv
+                                } else {
+                                    *cached = Some(required_bottom_target);
+                                    required_bottom_target
+                                }
+                            }
                         };
 
                         let mut current_x = (orig_advance - total_pinyin_width) / 2.0;
