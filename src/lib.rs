@@ -35,6 +35,47 @@ const TAG_GLYF: Tag = Tag::new(b"glyf");
 const TAG_LOCA: Tag = Tag::new(b"loca");
 const TAG_HEAD: Tag = Tag::new(b"head");
 
+fn make_name_table(display_name: &str) -> Vec<u8> {
+    // Build a simple 'name' table with two Windows (platform 3) UTF-16BE records
+    let utf16: Vec<u8> = display_name
+        .encode_utf16()
+        .flat_map(|u| u.to_be_bytes().to_vec())
+        .collect();
+
+    let len = utf16.len() as u16;
+    let mut table = Vec::new();
+
+    // format (u16) = 0, count (u16) = 2, stringOffset (u16)
+    let count: u16 = 2;
+    let string_offset: u16 = 6 + 12 * count; // header (6) + 12 bytes per record
+
+    table.extend_from_slice(&0u16.to_be_bytes());
+    table.extend_from_slice(&count.to_be_bytes());
+    table.extend_from_slice(&string_offset.to_be_bytes());
+
+    // Record 1: platformID=3 (Windows), encodingID=1 (UTF-16), lang=0x0409 (en-US), nameID=1 (Font Family)
+    table.extend_from_slice(&3u16.to_be_bytes()); // platform
+    table.extend_from_slice(&1u16.to_be_bytes()); // encoding
+    table.extend_from_slice(&0x0409u16.to_be_bytes()); // language
+    table.extend_from_slice(&1u16.to_be_bytes()); // nameID
+    table.extend_from_slice(&len.to_be_bytes()); // length
+    table.extend_from_slice(&0u16.to_be_bytes()); // offset
+
+    // Record 2: same but nameID=4 (Full font name), offset = len of first
+    table.extend_from_slice(&3u16.to_be_bytes()); // platform
+    table.extend_from_slice(&1u16.to_be_bytes()); // encoding
+    table.extend_from_slice(&0x0409u16.to_be_bytes()); // language
+    table.extend_from_slice(&4u16.to_be_bytes()); // nameID
+    table.extend_from_slice(&len.to_be_bytes()); // length
+    table.extend_from_slice(&len.to_be_bytes()); // offset (after first string)
+
+    // Append strings: first the family name, then the full name (we use the same value)
+    table.extend_from_slice(&utf16);
+    table.extend_from_slice(&utf16);
+
+    table
+}
+
 pub struct PathPen {
     pub path: BezPath,
 }
@@ -74,7 +115,13 @@ impl OutlinePen for PathPen {
     }
 }
 
-pub fn process_font_file(font_data: &[u8], renderers: Vec<impl RubyRenderer>) -> Result<Vec<u8>> {
+const TAG_NAME: Tag = Tag::new(b"name");
+
+pub fn process_font_file(
+    font_data: &[u8],
+    renderers: Vec<impl RubyRenderer>,
+    display_name: Option<&str>,
+) -> Result<Vec<u8>> {
     let file =
         FileRef::new(font_data).map_err(|e| anyhow!("Failed to parse input font file: {:?}", e))?;
 
@@ -87,10 +134,14 @@ pub fn process_font_file(font_data: &[u8], renderers: Vec<impl RubyRenderer>) ->
         .clone()
         .map_err(|e| anyhow!("Failed to load first font: {:?}", e))?;
 
-    process_single_font(font_ref, renderers)
+    process_single_font(font_ref, renderers, display_name)
 }
 
-fn process_single_font(font: FontRef, renderers: Vec<impl RubyRenderer>) -> Result<Vec<u8>> {
+fn process_single_font(
+    font: FontRef,
+    renderers: Vec<impl RubyRenderer>,
+    display_name: Option<&str>,
+) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx().context("Missing hmtx")?;
@@ -170,7 +221,13 @@ fn process_single_font(font: FontRef, renderers: Vec<impl RubyRenderer>) -> Resu
     for record in font.table_directory.table_records() {
         let tag = record.tag();
 
+        // Skip glyf/loca - we'll insert rebuilt data later
         if tag == TAG_GLYF || tag == TAG_LOCA {
+            continue;
+        }
+
+        // Also skip name if we plan to override it
+        if tag == TAG_NAME && display_name.is_some() {
             continue;
         }
 
@@ -191,6 +248,12 @@ fn process_single_font(font: FontRef, renderers: Vec<impl RubyRenderer>) -> Resu
 
     let _ = builder.add_table(&glyf_data);
     let _ = builder.add_table(&loca_data);
+
+    // If requested, override the 'name' table with the supplied display name.
+    if let Some(name) = display_name {
+        let name_bytes = make_name_table(name);
+        let _ = builder.add_raw(TAG_NAME, name_bytes);
+    }
 
     Ok(builder.build())
 }
