@@ -60,5 +60,6 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to write output file: {:?}", cli.output))?;
 
     println!("Successfully created pinyin font at {:?}", cli.output);
+
     Ok(())
 }
