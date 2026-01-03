@@ -17,3 +17,14 @@ pub trait RubyRenderer: Send + Sync {
         main_upem: f64,
     ) -> Result<()>;
 }
+
+/// Positioning options for ruby annotations relative to the base glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RubyPosition {
+    Top,
+    Bottom,
+    LeftDown,
+    LeftUp,
+    RightDown,
+    RightUp,
+}

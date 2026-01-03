@@ -11,6 +11,16 @@ enum CharactersArg {
     Pinyin,
 }
 
+#[derive(Clone, ValueEnum, Debug)]
+enum RubyPositionArg {
+    Top,
+    Bottom,
+    LeftDown,
+    LeftUp,
+    RightDown,
+    RightUp,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -27,6 +37,10 @@ struct Cli {
     /// Choose character set(s): `none` or `pinyin`. Can be repeated to enable multiple sets. Default: `pinyin`
     #[arg(long, value_enum, default_values_t = [CharactersArg::Pinyin])]
     characters: Vec<CharactersArg>,
+
+    /// Where to place ruby text relative to base glyph. Default: `Top`
+    #[arg(long, value_enum, default_value_t = RubyPositionArg::Top)]
+    position: RubyPositionArg,
 
     /// Scale ratio for ruby text (fraction of main font size). Default: 0.3
     #[arg(long, default_value_t = 0.3)]
@@ -95,12 +109,22 @@ fn main() -> Result<()> {
                 None
             };
 
+        let position = match cli.position {
+            RubyPositionArg::Top => rubify::renderer::RubyPosition::Top,
+            RubyPositionArg::Bottom => rubify::renderer::RubyPosition::Bottom,
+            RubyPositionArg::LeftDown => rubify::renderer::RubyPosition::LeftDown,
+            RubyPositionArg::LeftUp => rubify::renderer::RubyPosition::LeftUp,
+            RubyPositionArg::RightDown => rubify::renderer::RubyPosition::RightDown,
+            RubyPositionArg::RightUp => rubify::renderer::RubyPosition::RightUp,
+        };
+
         let renderer = rubify::renderer::pinyin::PinyinRenderer::new(
             font_ref.expect("Pinyin font data is required for Pinyin renderer"),
             cli.scale,
             cli.gutter,
             delimiter_char,
             cli.spacing,
+            position,
         )
         .expect("Failed to create Pinyin renderer");
 
