@@ -1,7 +1,9 @@
 [package]
-edition = "2024"
 name = "rubify"
 version = "0.1.0"
+description = "A tool for adding ruby annotations to fonts."
+edition = "2024"
+license = "MIT"
 
 [features]
 default = ["pinyin"]
