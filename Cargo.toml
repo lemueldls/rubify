@@ -10,6 +10,7 @@ pinyin = ["dep:pinyin"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+facet = "*"
 font-types = "0.10"
 fontcull = "2.0"
 fontcull-font-types = "0.10"

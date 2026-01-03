@@ -11,8 +11,7 @@ use read_fonts::{
     types::{GlyphId, Tag},
 };
 
-#[cfg(feature = "pinyin")]
-mod ruby;
+pub mod renderer;
 use skrifa::{MetadataProvider, outline::OutlinePen};
 use woofwoof;
 use write_fonts::{
@@ -20,6 +19,8 @@ use write_fonts::{
     from_obj::ToOwnedObj,
     tables::glyf::{GlyfLocaBuilder, Glyph as WriteGlyph, SimpleGlyph as WriteSimpleGlyph},
 };
+
+use crate::renderer::RubyRenderer;
 
 // CJK
 const CJK_RANGE: RangeInclusive<u32> = 0x4e00..=0x9fff;
@@ -73,7 +74,7 @@ impl OutlinePen for PathPen {
     }
 }
 
-pub fn process_font_file(font_data: &[u8], pinyin_font_data: Option<&[u8]>) -> Result<Vec<u8>> {
+pub fn process_font_file(font_data: &[u8], renderers: Vec<impl RubyRenderer>) -> Result<Vec<u8>> {
     let file =
         FileRef::new(font_data).map_err(|e| anyhow!("Failed to parse input font file: {:?}", e))?;
 
@@ -86,28 +87,10 @@ pub fn process_font_file(font_data: &[u8], pinyin_font_data: Option<&[u8]>) -> R
         .clone()
         .map_err(|e| anyhow!("Failed to load first font: {:?}", e))?;
 
-    let pinyin_font_ref = if let Some(data) = pinyin_font_data {
-        let pfile =
-            FileRef::new(data).map_err(|e| anyhow!("Failed to parse pinyin font file: {:?}", e))?;
-        let pfonts: Vec<_> = pfile.fonts().collect();
-
-        if pfonts.is_empty() {
-            return Err(anyhow!("No fonts found in pinyin font file"));
-        }
-
-        Some(
-            pfonts[0]
-                .clone()
-                .map_err(|e| anyhow!("Failed to load first font from pinyin font file: {:?}", e))?,
-        )
-    } else {
-        None
-    };
-
-    process_single_font(font_ref, pinyin_font_ref)
+    process_single_font(font_ref, renderers)
 }
 
-fn process_single_font(font: FontRef, _pinyin_font: Option<FontRef>) -> Result<Vec<u8>> {
+fn process_single_font(font: FontRef, renderers: Vec<impl RubyRenderer>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx().context("Missing hmtx")?;
@@ -115,21 +98,6 @@ fn process_single_font(font: FontRef, _pinyin_font: Option<FontRef>) -> Result<V
     let outlines = font.outline_glyphs();
     let num_glyphs = maxp.num_glyphs();
     let upem = font.head()?.units_per_em() as f64;
-
-    #[cfg(feature = "pinyin")]
-    let ruby_renderer: Option<Box<dyn crate::ruby::RubyRenderer>> = {
-        if let Some(pf) = _pinyin_font.as_ref() {
-            match crate::ruby::pinyin::PinyinRenderer::new(pf.clone(), 0.3, upem) {
-                Ok(r) => Some(Box::new(r)),
-                Err(err) => {
-                    eprintln!("Warning: failed to initialize pinyin renderer: {:?}", err);
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    };
 
     let mut gid_to_char: HashMap<GlyphId, char> = HashMap::new();
 
@@ -165,14 +133,16 @@ fn process_single_font(font: FontRef, _pinyin_font: Option<FontRef>) -> Result<V
         }
 
         if let Some(&ch) = gid_to_char.get(&gid) {
-            #[cfg(feature = "pinyin")]
-            if let Some(renderer) = &ruby_renderer {
+            for renderer in &renderers {
                 let orig_advance = hmtx
                     .h_metrics()
                     .get(gid.to_u32() as usize)
                     .map(|m| m.advance.get())
                     .unwrap_or(upem as u16) as f64;
-                let _ = renderer.annotate(ch, &mut final_path, orig_advance, upem);
+
+                renderer
+                    .annotate(ch, &mut final_path, orig_advance, upem)
+                    .context("Failed to annotate")?;
             }
         }
 
