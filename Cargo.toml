@@ -1,0 +1,19 @@
+[package]
+name = "pinyinify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+read-fonts = { version = "*", features = ["experimental_traverse"] }
+write-fonts = "*"
+font-types = "*"
+skrifa = "*"
+kurbo = "0.12"
+pinyin = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+fontcull = "2.0.0"
+fontcull-klippa = "0.1.2"
+fontcull-read-fonts = "0.38.0"
+fontcull-font-types = "0.10.2"
+woofwoof = "1.0.2"
