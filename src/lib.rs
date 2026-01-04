@@ -258,7 +258,15 @@ fn process_single_font(
     Ok(builder.build())
 }
 
-pub fn subset_cjk(font_data: &[u8]) -> Result<Vec<u8>> {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RubyCharacters {
+    Pinyin,
+}
+
+pub fn subset_by_sets(
+    font_data: &[u8],
+    sets: &std::collections::HashSet<RubyCharacters>,
+) -> Result<Vec<u8>> {
     let file =
         frf::FileRef::new(font_data).map_err(|_| anyhow!("Failed to parse font for subsetting"))?;
     let font = file
@@ -267,20 +275,13 @@ pub fn subset_cjk(font_data: &[u8]) -> Result<Vec<u8>> {
         .context("No font found for subsetting")?
         .map_err(|e| anyhow!("Read error: {:?}", e))?;
 
-    // Build unicodes set: CJK + ASCII + Pinyin
+    // Build unicodes set based on provided character sets
     let mut unicodes = IntSet::<u32>::empty();
 
-    for c in CJK_RANGE {
-        unicodes.insert(c);
-    }
-    for c in ASCII_RANGE {
-        unicodes.insert(c);
-    }
-    for c in LATIN_EXTENDED_RANGE {
-        unicodes.insert(c);
-    }
-    for c in COMBINING_DIACRITICS_RANGE {
-        unicodes.insert(c);
+    if sets.contains(&RubyCharacters::Pinyin) {
+        for c in CJK_RANGE {
+            unicodes.insert(c);
+        }
     }
 
     use fontcull_font_types::{GlyphId as FrfGlyphId, NameId as FrfNameId, Tag as FrfTag};

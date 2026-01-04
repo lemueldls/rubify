@@ -18,10 +18,6 @@ pub struct PinyinRenderer<'a> {
     scale_ratio: f64,
     /// gap (in em units) between the base glyph and the ruby text
     gutter_em: f64,
-    /// optional delimiter char to split ruby text into parts
-    delimiter: Option<char>,
-    /// spacing between parts (in em units)
-    spacing_em: f64,
     /// position of the ruby relative to the base glyph
     position: RubyPosition,
     /// baseline offset in em units to fine tune annotation baseline
@@ -39,8 +35,6 @@ impl<'a> PinyinRenderer<'a> {
         font: FontRef<'a>,
         scale_ratio: f64,
         gutter_em: f64,
-        delimiter: Option<char>,
-        spacing_em: f64,
         position: RubyPosition,
         baseline_offset_em: f64,
         tight: bool,
@@ -52,8 +46,6 @@ impl<'a> PinyinRenderer<'a> {
             upem,
             scale_ratio,
             gutter_em,
-            delimiter,
-            spacing_em,
             position,
             baseline_offset_em,
             tight,
@@ -74,12 +66,8 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
         if let Some(p) = ch.to_pinyin() {
             let pinyin_text = p.with_tone();
 
-            // split into parts if a delimiter is provided, otherwise treat the whole text as one part
-            let parts: Vec<String> = if let Some(d) = self.delimiter {
-                pinyin_text.split(d).map(|s| s.to_string()).collect()
-            } else {
-                vec![pinyin_text.to_string()]
-            };
+            // Treat the entire pinyin text as one part (no delimiter splitting)
+            let parts: Vec<String> = vec![pinyin_text.to_string()];
 
             if parts.is_empty() {
                 return Ok(());
@@ -153,9 +141,7 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
                     parts_widths.push(part_width);
                 }
 
-                let spacing_units = self.spacing_em * main_upem; // spacing between parts in font units
-                let total_pinyin_width = parts_widths.iter().sum::<f64>()
-                    + spacing_units * (parts_widths.len().saturating_sub(1) as f64);
+                let total_pinyin_width = parts_widths.iter().sum::<f64>();
 
                 let bbox = final_path.bounding_box();
                 let gutter_units = self.gutter_em * main_upem;
@@ -251,7 +237,7 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
                         let mut current_x = (orig_advance - total_pinyin_width) / 2.0;
 
                         // render each part in order, separated by spacing
-                        for (i, part_paths) in parts_paths.into_iter().enumerate() {
+                        for part_paths in parts_paths.into_iter() {
                             for (pgid, mut p_path) in part_paths {
                                 let xform = Affine::translate((current_x, target_y))
                                     * Affine::scale(p_scale_factor);
@@ -279,11 +265,6 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
                                     as f64;
 
                                 current_x += adv * p_scale_factor;
-                            }
-
-                            // after part, add spacing before next part (except after last)
-                            if i + 1 < parts_widths.len() {
-                                current_x += spacing_units;
                             }
                         }
                     }
@@ -314,7 +295,7 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
                         let max_glyph_width =
                             glyph_list.iter().map(|(w, _)| *w).fold(0.0f64, f64::max);
 
-                        let vertical_step = approx_height + spacing_units;
+                        let vertical_step = approx_height;
 
                         let start_x = match self.position {
                             RubyPosition::LeftDown | RubyPosition::LeftUp => {

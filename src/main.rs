@@ -6,8 +6,7 @@ use read_fonts::FileRef;
 
 #[derive(Clone, ValueEnum, PartialEq, Eq, Hash)]
 #[repr(u8)]
-enum CharactersArg {
-    None,
+enum RubyCharactersArg {
     Pinyin,
 }
 
@@ -48,29 +47,21 @@ struct Cli {
     #[arg(long)]
     display_name: Option<String>,
 
-    /// Choose character set(s): `none` or `pinyin`. Can be repeated to enable multiple sets.
-    #[arg(long, value_enum, default_values_t = [CharactersArg::Pinyin])]
-    characters: Vec<CharactersArg>,
+    /// Ruby characters. Can be repeated to enable multiple sets.
+    #[arg(long, value_enum, default_values_t = [RubyCharactersArg::Pinyin])]
+    chars: Vec<RubyCharactersArg>,
 
     /// Where to place ruby text relative to base glyph.
     #[arg(long, value_enum, default_value_t = RubyPositionArg::Top)]
     position: RubyPositionArg,
 
     /// Scale ratio for ruby text (fraction of main font size).
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = 0.4)]
     scale: f64,
 
-    /// Gutter (in em) between base glyph and ruby text. Default: 0.05
+    /// Gutter (in em) between base glyph and ruby text.
     #[arg(long, default_value_t = 0.0)]
     gutter: f64,
-
-    /// Delimiter string to split ruby text into parts (must be single character)
-    #[arg(long)]
-    delimiter: Option<String>,
-
-    /// Spacing (in em) to insert between parts when delimiter is used. Default: 0.0
-    #[arg(long, default_value_t = 0.0)]
-    spacing: f64,
 
     /// When set, use tight per-character placement (legacy behavior). By default we use a consistent baseline.
     #[arg(long)]
@@ -80,7 +71,7 @@ struct Cli {
     #[arg(long, default_value_t = 0.0)]
     baseline_offset: f64,
 
-    /// Subset the font to include only CJK and Pinyin characters
+    /// Subset the font to include only annotation characters.
     #[arg(long)]
     subset: bool,
 }
@@ -94,24 +85,11 @@ fn main() -> Result<()> {
         None
     };
 
-    // convert delimiter string to Option<char> (must be single char)
-    let delimiter_char: Option<char> = match cli.delimiter {
-        Some(ref s) if s.chars().count() == 1 => s.chars().next(),
-        Some(ref s) => {
-            eprintln!(
-                "Warning: --delimiter must be a single character; ignoring `{}`",
-                s
-            );
-            None
-        }
-        None => None,
-    };
-
-    let characters = HashSet::<CharactersArg>::from_iter(cli.characters);
+    let characters = HashSet::<RubyCharactersArg>::from_iter(cli.chars);
 
     // We'll keep the ruby font data and renderer options so we can construct
     // renderers per-input when processing files (this supports batch directory mode).
-    let pinyin_font_bytes = ruby_font_data.clone();
+    let ruby_font_bytes = ruby_font_data.clone();
 
     let position = match cli.position {
         RubyPositionArg::Top => rubify::renderer::RubyPosition::Top,
@@ -123,31 +101,32 @@ fn main() -> Result<()> {
     };
 
     // Helper to build renderers for each file when needed
-    let build_renderers = |chars: &HashSet<CharactersArg>| -> Result<Vec<rubify::renderer::pinyin::PinyinRenderer<'static>>> {
-        let mut result: Vec<rubify::renderer::pinyin::PinyinRenderer<'static>> = Vec::new();
+    let build_renderers = |rb_chars: &HashSet<RubyCharactersArg>| {
+        let mut result = Vec::new();
 
-        if chars.contains(&CharactersArg::Pinyin) {
-            let data = pinyin_font_bytes
+        if rb_chars.contains(&RubyCharactersArg::Pinyin) {
+            let data = ruby_font_bytes
                 .as_ref()
                 .ok_or_else(|| anyhow!("Pinyin font data is required for Pinyin renderer"))?;
 
             // Leaked static slice so we can create a FontRef with 'static lifetime for the renderer
             let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
-            let pfile2 = FileRef::new(leaked).map_err(|e| anyhow!("Failed to parse ruby font file: {:?}", e))?;
+            let pfile2 = FileRef::new(leaked)
+                .map_err(|e| anyhow!("Failed to parse ruby font file: {:?}", e))?;
             let pfonts2: Vec<_> = pfile2.fonts().collect();
 
             if pfonts2.is_empty() {
                 return Err(anyhow!("No fonts found in ruby font file"));
             }
 
-            let pfont2 = pfonts2[0].clone().map_err(|e| anyhow!("Failed to load font from ruby font file: {:?}", e))?;
+            let pfont2 = pfonts2[0]
+                .clone()
+                .map_err(|e| anyhow!("Failed to load font from ruby font file: {:?}", e))?;
 
             let renderer = rubify::renderer::pinyin::PinyinRenderer::new(
                 pfont2,
                 cli.scale,
                 cli.gutter,
-                delimiter_char,
-                cli.spacing,
                 position,
                 cli.baseline_offset,
                 cli.tight,
@@ -219,9 +198,10 @@ fn main() -> Result<()> {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| anyhow!("Invalid file name"))?;
+
             dir.join(file_name)
         } else {
-            // default: same dir, append -pinyin before extension
+            // default: same dir, append -ruby before extension
             let stem = in_path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -230,7 +210,8 @@ fn main() -> Result<()> {
                 .extension()
                 .and_then(|s| s.to_str())
                 .unwrap_or("ttf");
-            in_path.with_file_name(format!("{}-pinyin.{}", stem, ext))
+
+            in_path.with_file_name(format!("{}-ruby.{}", stem, ext))
         };
 
         let font_data = fs::read(in_path)
@@ -246,7 +227,13 @@ fn main() -> Result<()> {
 
         if cli.subset {
             println!("Subsetting font...");
-            new_font_data = rubify::subset_cjk(&new_font_data)?;
+            let mut sets = std::collections::HashSet::new();
+
+            if characters.contains(&RubyCharactersArg::Pinyin) {
+                sets.insert(rubify::RubyCharacters::Pinyin);
+            }
+
+            new_font_data = rubify::subset_by_sets(&new_font_data, &sets)?;
         }
 
         // Infer format from output extension
@@ -300,7 +287,13 @@ fn main() -> Result<()> {
 
             if cli.subset {
                 println!("Subsetting font {:?}...", path);
-                new_font_data = rubify::subset_cjk(&new_font_data)?;
+                let mut sets = std::collections::HashSet::new();
+
+                if characters.contains(&RubyCharactersArg::Pinyin) {
+                    sets.insert(rubify::RubyCharacters::Pinyin);
+                }
+
+                new_font_data = rubify::subset_by_sets(&new_font_data, &sets)?;
             }
 
             // Convert to woff2 if requested
