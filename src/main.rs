@@ -1,205 +1,161 @@
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf, str::FromStr};
 
-use anyhow::{Context, Result, anyhow};
-use clap::{Parser, ValueEnum};
-use read_fonts::FileRef;
+use facet::{Facet, bitflags};
+use facet_args as args;
+use fontcull_read_fonts::FileRef;
+use glob::glob;
+use miette::{Error, IntoDiagnostic, Result, WrapErr, miette};
+use rubify::renderer::{RubyPosition, RubyRenderer};
+use tracing::info;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Clone, ValueEnum, PartialEq, Eq, Hash)]
-#[repr(u8)]
-enum RubyCharactersArg {
-    Pinyin,
-}
-
-#[derive(Clone, ValueEnum, Debug)]
-enum RubyPositionArg {
-    Top,
-    Bottom,
-    LeftDown,
-    LeftUp,
-    RightDown,
-    RightUp,
-}
-
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[derive(Facet)]
 struct Cli {
     /// Input paths or glob patterns (can be repeated), e.g. 'fonts/*.ttf' or 'file.ttf'
-    #[arg(value_name = "INPUT", num_args = 1..)]
-    inputs: Vec<String>,
+    // #[arg(value_name = "INPUT", num_args = 1..)]
+    #[facet(args::positional)]
+    inputs: Vec<PathBuf>,
 
     /// Output file for single input (mutually exclusive with --out-dir)
-    #[arg(long, value_name = "FILE")]
+    // #[arg(long, value_name = "FILE")]
+    #[facet(args::named)]
     out: Option<PathBuf>,
 
     /// Output directory for multiple inputs or globs
-    #[arg(long, value_name = "DIR")]
+    // #[arg(long, value_name = "DIR")]
+    #[facet(args::named)]
     out_dir: Option<PathBuf>,
 
     /// Optional font file to use for ruby characters
-    #[arg(long)]
+    #[facet(args::named)]
     font: Option<PathBuf>,
 
-    /// Force converting all outputs to WOFF2 when using glob/directory mode
-    #[arg(long)]
-    woff2: bool,
-
     /// Override the exported font display name (full name and family)
-    #[arg(long)]
+    #[facet(args::named)]
     display_name: Option<String>,
 
     /// Ruby characters. Can be repeated to enable multiple sets.
-    #[arg(long, value_enum, default_values_t = [RubyCharactersArg::Pinyin])]
-    chars: Vec<RubyCharactersArg>,
+    #[facet(args::named, default = default_characters())]
+    chars: String,
 
-    /// Where to place ruby text relative to base glyph.
-    #[arg(long, value_enum, default_value_t = RubyPositionArg::Top)]
-    position: RubyPositionArg,
+    /// Where to place ruby characters relative to base glyph.
+    #[facet(args::named, default = RubyPosition::Top)]
+    position: RubyPosition,
 
-    /// Scale ratio for ruby text (fraction of main font size).
-    #[arg(long, default_value_t = 0.4)]
+    /// Scale ratio for ruby characters (fraction of main font size).
+    #[facet(args::named, default = 0.4)]
     scale: f64,
 
-    /// Gutter (in em) between base glyph and ruby text.
-    #[arg(long, default_value_t = 0.0)]
+    /// Gutter (in em) between base glyph and ruby characters.
+    #[facet(args::named, default = 0.0)]
     gutter: f64,
 
-    /// When set, use tight per-character placement (legacy behavior). By default we use a consistent baseline.
-    #[arg(long)]
+    /// When set, use tight per-character placement. By default we use a consistent baseline.
+    #[facet(args::named, default = false)]
     tight: bool,
 
     /// Fine-tune baseline offset (in em units). Positive moves annotation further away from base glyph.
-    #[arg(long, default_value_t = 0.0)]
+    #[facet(args::named, default = 0.0)]
     baseline_offset: f64,
 
     /// Subset the font to include only annotation characters.
-    #[arg(long)]
+    #[facet(args::named, default = false)]
     subset: bool,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    let ruby_font_data = if let Some(path) = &cli.font {
-        Some(fs::read(path).with_context(|| format!("Failed to read ruby font file: {:?}", path))?)
-    } else {
-        None
-    };
-
-    let characters = HashSet::<RubyCharactersArg>::from_iter(cli.chars);
-
-    // We'll keep the ruby font data and renderer options so we can construct
-    // renderers per-input when processing files (this supports batch directory mode).
-    let ruby_font_bytes = ruby_font_data.clone();
-
-    let position = match cli.position {
-        RubyPositionArg::Top => rubify::renderer::RubyPosition::Top,
-        RubyPositionArg::Bottom => rubify::renderer::RubyPosition::Bottom,
-        RubyPositionArg::LeftDown => rubify::renderer::RubyPosition::LeftDown,
-        RubyPositionArg::LeftUp => rubify::renderer::RubyPosition::LeftUp,
-        RubyPositionArg::RightDown => rubify::renderer::RubyPosition::RightDown,
-        RubyPositionArg::RightUp => rubify::renderer::RubyPosition::RightUp,
-    };
-
-    // Helper to build renderers for each file when needed
-    let build_renderers = |rb_chars: &HashSet<RubyCharactersArg>| {
-        let mut result = Vec::new();
-
-        if rb_chars.contains(&RubyCharactersArg::Pinyin) {
-            let data = ruby_font_bytes
-                .as_ref()
-                .ok_or_else(|| anyhow!("Pinyin font data is required for Pinyin renderer"))?;
-
-            // Leaked static slice so we can create a FontRef with 'static lifetime for the renderer
-            let leaked: &'static [u8] = Box::leak(data.clone().into_boxed_slice());
-            let pfile2 = FileRef::new(leaked)
-                .map_err(|e| anyhow!("Failed to parse ruby font file: {:?}", e))?;
-            let pfonts2: Vec<_> = pfile2.fonts().collect();
-
-            if pfonts2.is_empty() {
-                return Err(anyhow!("No fonts found in ruby font file"));
-            }
-
-            let pfont2 = pfonts2[0]
-                .clone()
-                .map_err(|e| anyhow!("Failed to load font from ruby font file: {:?}", e))?;
-
-            let renderer = rubify::renderer::pinyin::PinyinRenderer::new(
-                pfont2,
-                cli.scale,
-                cli.gutter,
-                position,
-                cli.baseline_offset,
-                cli.tight,
-            )?;
-
-            result.push(renderer);
-        }
-
-        Ok(result)
-    };
-
-    // Expand input patterns (globs, directories, single files)
-    use glob::glob;
-
-    fn expand_inputs(patterns: &[String]) -> Result<Vec<PathBuf>> {
-        let mut out: Vec<PathBuf> = Vec::new();
-
-        for p in patterns {
-            if p.contains('*') || p.contains('?') || p.contains('[') {
-                for entry in
-                    glob(p).with_context(|| format!("Failed to expand glob pattern: {}", p))?
-                {
-                    match entry {
-                        Ok(path) if path.is_file() => out.push(path),
-                        _ => {}
-                    }
-                }
-            } else {
-                let pb = PathBuf::from(p);
-                if pb.is_dir() {
-                    for entry in fs::read_dir(&pb)
-                        .with_context(|| format!("Failed to read dir: {:?}", pb))?
-                    {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.is_file() {
-                            out.push(path);
-                        }
-                    }
-                } else if pb.is_file() {
-                    out.push(pb);
-                } else {
-                    return Err(anyhow!(
-                        "Input path does not exist or is not a file/dir: {}",
-                        p
-                    ));
-                }
-            }
-        }
-
-        if out.is_empty() {
-            return Err(anyhow!("No input files matched"));
-        }
-
-        Ok(out)
+bitflags! {
+    pub struct RubyCharactersFlags: u8 {
+        #[cfg(feature = "pinyin")]
+        const PINYIN = 1 << 0;
+        #[cfg(feature = "romaji")]
+        const ROMAJI = 1 << 1;
     }
+}
 
-    let input_paths = expand_inputs(&cli.inputs)?;
+impl FromStr for RubyCharactersFlags {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let chars = s.split(",");
+        let mut flags = RubyCharactersFlags::empty();
+
+        for ch in chars {
+            match ch.to_lowercase().as_str() {
+                #[cfg(feature = "pinyin")]
+                "pinyin" => flags.insert(RubyCharactersFlags::PINYIN),
+                #[cfg(feature = "romaji")]
+                "romaji" => flags.insert(RubyCharactersFlags::ROMAJI),
+                other => {
+                    return Err(miette!("Unknown ruby characters argument: {}", other));
+                }
+            }
+        }
+
+        Ok(flags)
+    }
+}
+
+fn default_characters() -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    #[cfg(feature = "pinyin")]
+    parts.push("pinyin".to_string());
+    #[cfg(feature = "romaji")]
+    parts.push("romaji".to_string());
+
+    parts.join(",")
+}
+
+fn main() -> Result<()> {
+    let indicatif_layer = IndicatifLayer::new();
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "rubify=info,tower_buffer=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
+        .with(indicatif_layer)
+        .init();
+
+    let cli: Cli = args::from_std_args()?;
+
+    let rb_chars = RubyCharactersFlags::from_str(&cli.chars)
+        .wrap_err_with(|| format!("Failed to parse --chars argument: {}", &cli.chars))?;
+
+    let mut input_paths: Vec<PathBuf> = Vec::new();
+
+    for p in &cli.inputs {
+        let pattern = p
+            .to_str()
+            .ok_or_else(|| miette!("Failed to convert path"))?;
+
+        for entry in glob(pattern)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("Failed to expand glob pattern: {p:?}"))?
+        {
+            match entry {
+                Ok(path) if path.is_file() => input_paths.push(path),
+                _ => {}
+            }
+        }
+    }
 
     // Determine output behavior
     if input_paths.len() == 1 {
         // single input
         let in_path = &input_paths[0];
 
-        let out_path: PathBuf = if let Some(ref out_file) = cli.out {
-            out_file.clone()
-        } else if let Some(ref dir) = cli.out_dir {
+        let out_path = if let Some(out_file) = &cli.out {
+            out_file
+        } else if let Some(dir) = &cli.out_dir {
             let file_name = in_path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("Invalid file name"))?;
+                .ok_or_else(|| miette!("Invalid file name"))?;
 
-            dir.join(file_name)
+            &dir.join(file_name)
         } else {
             // default: same dir, append -ruby before extension
             let stem = in_path
@@ -211,113 +167,156 @@ fn main() -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("ttf");
 
-            in_path.with_file_name(format!("{}-ruby.{}", stem, ext))
+            &in_path.with_file_name(format!("{}-ruby.{}", stem, ext))
         };
 
-        let font_data = fs::read(in_path)
-            .with_context(|| format!("Failed to read input file: {:?}", in_path))?;
-
-        println!("Processing {:?} -> {:?}...", in_path, out_path);
-
-        let mut new_font_data = rubify::process_font_file(
-            &font_data,
-            build_renderers(&characters)?,
-            cli.display_name.as_deref(),
-        )?;
-
-        if cli.subset {
-            println!("Subsetting font...");
-            let mut sets = std::collections::HashSet::new();
-
-            if characters.contains(&RubyCharactersArg::Pinyin) {
-                sets.insert(rubify::RubyCharacters::Pinyin);
-            }
-
-            new_font_data = rubify::subset_by_sets(&new_font_data, &sets)?;
-        }
-
-        // Infer format from output extension
-        let extension = out_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_lowercase());
-
-        if let Some("woff2") = extension.as_deref() {
-            println!("Converting to WOFF2...");
-            new_font_data = rubify::convert_to_woff2(&new_font_data)?;
-        }
-
-        fs::write(&out_path, new_font_data)
-            .with_context(|| format!("Failed to write output file: {:?}", out_path))?;
-
-        println!("Wrote {:?}", out_path);
+        process_font(&cli, rb_chars, in_path, out_path)?;
     } else {
         // multiple inputs: require out_dir
-        let out_dir = cli
-            .out_dir
-            .as_ref()
-            .with_context(|| "--out-dir must be provided when processing multiple inputs/globs")?;
+        let out_dir = cli.out_dir.as_ref().ok_or_else(|| {
+            miette!("--out-dir must be provided when processing multiple inputs/globs")
+        })?;
 
         if !out_dir.exists() {
             fs::create_dir_all(out_dir)
-                .with_context(|| format!("Failed to create out-dir: {:?}", out_dir))?;
+                .into_diagnostic()
+                .wrap_err_with(|| format!("Failed to create out-dir: {:?}", out_dir))?;
         }
 
-        println!(
+        info!(
             "Processing {} inputs -> {:?}...",
             input_paths.len(),
             out_dir
         );
 
-        for path in input_paths {
-            let file_name = path
+        for in_path in &input_paths {
+            let file_name = in_path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("Invalid file name"))?
+                .ok_or_else(|| miette!("Invalid file name"))?
                 .to_string();
 
-            let font_data = fs::read(&path)
-                .with_context(|| format!("Failed to read input file: {:?}", path))?;
+            // // Convert to woff2 if requested
+            // let out_name = if cli.woff2 {
+            //     info!("Converting {:?} to WOFF2...", in_path);
+            //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
+            //     let stem = in_path
+            //         .file_stem()
+            //         .and_then(|s| s.to_str())
+            //         .unwrap_or(&file_name);
+            //     format!("{}.woff2", stem)
+            // } else {
+            //     file_name.clone()
+            // };
 
-            let mut new_font_data = rubify::process_font_file(
-                &font_data,
-                build_renderers(&characters)?,
-                cli.display_name.as_deref(),
-            )?;
+            let out_path = out_dir.join(file_name);
 
-            if cli.subset {
-                println!("Subsetting font {:?}...", path);
-                let mut sets = std::collections::HashSet::new();
-
-                if characters.contains(&RubyCharactersArg::Pinyin) {
-                    sets.insert(rubify::RubyCharacters::Pinyin);
-                }
-
-                new_font_data = rubify::subset_by_sets(&new_font_data, &sets)?;
-            }
-
-            // Convert to woff2 if requested
-            let out_name = if cli.woff2 {
-                println!("Converting {:?} to WOFF2...", path);
-                new_font_data = rubify::convert_to_woff2(&new_font_data)?;
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&file_name);
-                format!("{}.woff2", stem)
-            } else {
-                file_name.clone()
-            };
-
-            let out_path = out_dir.join(out_name);
-
-            fs::write(&out_path, new_font_data)
-                .with_context(|| format!("Failed to write output file: {:?}", out_path))?;
-
-            println!("Wrote {:?}", out_path);
+            process_font(&cli, rb_chars, in_path, &out_path)?;
         }
 
-        println!("Done processing inputs.");
+        info!("Done processing inputs.");
     }
+
+    Ok(())
+}
+
+fn process_font(
+    cli: &Cli,
+    rb_chars: RubyCharactersFlags,
+    in_path: &PathBuf,
+    out_path: &PathBuf,
+) -> Result<(), miette::Error> {
+    let base_font_data = fs::read(in_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to read input file: {:?}", in_path))?;
+    let base_file = FileRef::new(&base_font_data)
+        .map_err(|e| miette!("Failed to parse base font file: {:?}", e))?;
+
+    info!("Processing {:?} -> {:?}...", in_path, out_path);
+
+    let mut renderers: Vec<Box<dyn RubyRenderer>> = Vec::new();
+
+    let ruby_font_data = if let Some(path) = &cli.font {
+        fs::read(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("Failed to read ruby font file: {:?}", path))?
+    } else {
+        base_font_data.clone()
+    };
+    let ruby_font_data = Box::leak(ruby_font_data.into_boxed_slice());
+    let ruby_file = FileRef::new(ruby_font_data)
+        .map_err(|e| miette!("Failed to parse ruby font file: {:?}", e))?;
+    let ruby_fonts: Vec<_> = ruby_file.fonts().collect();
+
+    if ruby_fonts.is_empty() {
+        return Err(miette!("No fonts found in ruby font file"));
+    }
+
+    let ruby_font = ruby_fonts[0]
+        .as_ref()
+        .map_err(|e| miette!("Failed to load font from ruby font file: {:?}", e))?;
+
+    #[cfg(feature = "pinyin")]
+    if rb_chars.contains(RubyCharactersFlags::PINYIN) {
+        let renderer = rubify::renderer::pinyin::PinyinRenderer::new(
+            ruby_font.clone(),
+            cli.scale,
+            cli.gutter,
+            cli.position,
+            cli.baseline_offset,
+            cli.tight,
+        )?;
+
+        renderers.push(Box::new(renderer));
+    }
+
+    #[cfg(feature = "romaji")]
+    if rb_chars.contains(RubyCharactersFlags::ROMAJI) {
+        let renderer = rubify::renderer::romaji::RomajiRenderer::new(
+            ruby_font.clone(),
+            cli.scale,
+            cli.gutter,
+            cli.position,
+            cli.baseline_offset,
+            cli.tight,
+        )?;
+
+        renderers.push(Box::new(renderer));
+    }
+
+    let char_ranges = renderers
+        .iter()
+        .flat_map(|r| r.ranges().iter().cloned())
+        .collect::<Vec<_>>();
+
+    let mut new_font_data = rubify::process_font_file(
+        base_file,
+        &char_ranges,
+        &renderers,
+        cli.subset,
+        cli.display_name.as_deref(),
+    )?;
+
+    if cli.subset {
+        info!("Subsetting font...");
+        new_font_data = rubify::subset_by_renderers(&new_font_data, &renderers)?;
+    }
+
+    // let extension = out_path
+    //     .extension()
+    //     .and_then(|ext| ext.to_str())
+    //     .map(|ext| ext.to_lowercase());
+
+    // if let Some("woff2") = extension.as_deref() {
+    //     info!("Converting to WOFF2...");
+    //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
+    // }
+
+    fs::write(&out_path, new_font_data)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to write output file: {:?}", out_path))?;
+
+    info!("Wrote {:?}", out_path);
+
     Ok(())
 }
