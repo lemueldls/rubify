@@ -1,5 +1,5 @@
 {
-  description = "A tool for adding ruby annotations to fonts.";
+  description = "Add ruby characters to fonts.";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
