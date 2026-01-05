@@ -25,6 +25,7 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
+          meta.mainProgram = "rubify";
         };
 
         rubify = craneLib.buildPackage (
