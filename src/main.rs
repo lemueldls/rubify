@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, path::PathBuf, str::FromStr};
+use std::{fs, path::PathBuf, str::FromStr};
 
 use facet::{Facet, bitflags};
 use facet_args as args;
@@ -13,35 +13,28 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Facet)]
 struct Cli {
     /// Input paths or glob patterns (can be repeated), e.g. 'fonts/*.ttf' or 'file.ttf'
-    // #[arg(value_name = "INPUT", num_args = 1..)]
     #[facet(args::positional)]
     inputs: Vec<PathBuf>,
 
-    /// Output file for single input (mutually exclusive with --out-dir)
-    // #[arg(long, value_name = "FILE")]
-    #[facet(args::named)]
-    out: Option<PathBuf>,
-
-    /// Output directory for multiple inputs or globs
-    // #[arg(long, value_name = "DIR")]
-    #[facet(args::named)]
-    out_dir: Option<PathBuf>,
+    /// Output directory
+    #[facet(args::named, args::short = 'o')]
+    out_dir: PathBuf,
 
     /// Optional font file to use for ruby characters
     #[facet(args::named)]
     font: Option<PathBuf>,
 
-    /// Override the exported font display name (full name and family)
-    #[facet(args::named)]
-    display_name: Option<String>,
-
     /// Ruby characters. Can be repeated to enable multiple sets.
     #[facet(args::named, default = default_characters())]
-    chars: String,
+    ruby: String,
+
+    /// Subset the font to include only annotation characters.
+    #[facet(args::named, default = false)]
+    subset: bool,
 
     /// Where to place ruby characters relative to base glyph.
-    #[facet(args::named, default = RubyPosition::Top)]
-    position: RubyPosition,
+    #[facet(args::named, default = "top")]
+    position: String,
 
     /// Scale ratio for ruby characters (fraction of main font size).
     #[facet(args::named, default = 0.4)]
@@ -58,10 +51,6 @@ struct Cli {
     /// Fine-tune baseline offset (in em units). Positive moves annotation further away from base glyph.
     #[facet(args::named, default = 0.0)]
     baseline_offset: f64,
-
-    /// Subset the font to include only annotation characters.
-    #[facet(args::named, default = false)]
-    subset: bool,
 }
 
 bitflags! {
@@ -107,6 +96,18 @@ fn default_characters() -> String {
     parts.join(",")
 }
 
+fn position_from_str(s: &str) -> Result<RubyPosition, miette::Error> {
+    match s.to_lowercase().as_str() {
+        "top" => Ok(RubyPosition::Top),
+        "bottom" => Ok(RubyPosition::Bottom),
+        "leftdown" => Ok(RubyPosition::LeftDown),
+        "leftup" => Ok(RubyPosition::LeftUp),
+        "rightdown" => Ok(RubyPosition::RightDown),
+        "rightup" => Ok(RubyPosition::RightUp),
+        other => Err(miette!("Unknown ruby position argument: {}", other)),
+    }
+}
+
 fn main() -> Result<()> {
     let indicatif_layer = IndicatifLayer::new();
 
@@ -121,8 +122,8 @@ fn main() -> Result<()> {
 
     let cli: Cli = args::from_std_args()?;
 
-    let rb_chars = RubyCharactersFlags::from_str(&cli.chars)
-        .wrap_err_with(|| format!("Failed to parse --chars argument: {}", &cli.chars))?;
+    let rb_chars = RubyCharactersFlags::from_str(&cli.ruby)
+        .wrap_err_with(|| format!("Failed to parse --ruby argument: {}", &cli.ruby))?;
 
     let mut input_paths: Vec<PathBuf> = Vec::new();
 
@@ -142,80 +143,44 @@ fn main() -> Result<()> {
         }
     }
 
-    // Determine output behavior
-    if input_paths.len() == 1 {
-        // single input
-        let in_path = &input_paths[0];
-
-        let out_path = if let Some(out_file) = &cli.out {
-            out_file
-        } else if let Some(dir) = &cli.out_dir {
-            let file_name = in_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| miette!("Invalid file name"))?;
-
-            &dir.join(file_name)
-        } else {
-            // default: same dir, append -ruby before extension
-            let stem = in_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("output");
-            let ext = in_path
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("ttf");
-
-            &in_path.with_file_name(format!("{}-ruby.{}", stem, ext))
-        };
-
-        process_font(&cli, rb_chars, in_path, out_path)?;
-    } else {
-        // multiple inputs: require out_dir
-        let out_dir = cli.out_dir.as_ref().ok_or_else(|| {
-            miette!("--out-dir must be provided when processing multiple inputs/globs")
-        })?;
-
-        if !out_dir.exists() {
-            fs::create_dir_all(out_dir)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("Failed to create out-dir: {:?}", out_dir))?;
-        }
-
-        info!(
-            "Processing {} inputs -> {:?}...",
-            input_paths.len(),
-            out_dir
-        );
-
-        for in_path in &input_paths {
-            let file_name = in_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| miette!("Invalid file name"))?
-                .to_string();
-
-            // // Convert to woff2 if requested
-            // let out_name = if cli.woff2 {
-            //     info!("Converting {:?} to WOFF2...", in_path);
-            //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
-            //     let stem = in_path
-            //         .file_stem()
-            //         .and_then(|s| s.to_str())
-            //         .unwrap_or(&file_name);
-            //     format!("{}.woff2", stem)
-            // } else {
-            //     file_name.clone()
-            // };
-
-            let out_path = out_dir.join(file_name);
-
-            process_font(&cli, rb_chars, in_path, &out_path)?;
-        }
-
-        info!("Done processing inputs.");
+    if !cli.out_dir.exists() {
+        fs::create_dir_all(&cli.out_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("Failed to create out-dir: {:?}", cli.out_dir))?;
     }
+
+    info!(
+        "Processing {} inputs -> {:?}...",
+        input_paths.len(),
+        cli.out_dir
+    );
+
+    for in_path in &input_paths {
+        let file_name = in_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| miette!("Invalid file name"))?
+            .to_string();
+
+        // // Convert to woff2 if requested
+        // let out_name = if cli.woff2 {
+        //     info!("Converting {:?} to WOFF2...", in_path);
+        //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
+        //     let stem = in_path
+        //         .file_stem()
+        //         .and_then(|s| s.to_str())
+        //         .unwrap_or(&file_name);
+        //     format!("{}.woff2", stem)
+        // } else {
+        //     file_name.clone()
+        // };
+
+        let out_path = cli.out_dir.join(file_name);
+
+        process_font(&cli, rb_chars, in_path, &out_path)?;
+    }
+
+    info!("Done processing inputs.");
 
     Ok(())
 }
@@ -262,7 +227,7 @@ fn process_font(
             ruby_font.clone(),
             cli.scale,
             cli.gutter,
-            cli.position,
+            position_from_str(&cli.position)?,
             cli.baseline_offset,
             cli.tight,
         )?;
@@ -276,7 +241,7 @@ fn process_font(
             ruby_font.clone(),
             cli.scale,
             cli.gutter,
-            cli.position,
+            position_from_str(&cli.position)?,
             cli.baseline_offset,
             cli.tight,
         )?;
@@ -289,13 +254,7 @@ fn process_font(
         .flat_map(|r| r.ranges().iter().cloned())
         .collect::<Vec<_>>();
 
-    let mut new_font_data = rubify::process_font_file(
-        base_file,
-        &char_ranges,
-        &renderers,
-        cli.subset,
-        cli.display_name.as_deref(),
-    )?;
+    let mut new_font_data = rubify::process_font_file(base_file, &char_ranges, &renderers)?;
 
     if cli.subset {
         info!("Subsetting font...");
