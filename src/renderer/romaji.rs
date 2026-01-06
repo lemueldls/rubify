@@ -10,12 +10,19 @@ use super::{HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition, RubyRenderer, utils};
 pub struct RomajiRenderer<'a> {
     font: FontRef<'a>,
     upem: f64,
+    /// fraction of main font size to use for the ruby font (e.g. 0.7 = 70%)
     scale_ratio: f64,
+    /// gap (in em units) between the base glyph and the ruby text
     gutter_em: f64,
+    /// position of the ruby relative to the base glyph
     position: RubyPosition,
+    /// baseline offset in em units to fine tune annotation baseline
     baseline_offset_em: f64,
+    /// when true, use tight placement; otherwise a consistent baseline is used
     tight: bool,
+    /// cached consistent top target y (in main font units), computed lazily when placing Top annotations
     cached_top_target: Mutex<Option<f64>>,
+    /// cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
     cached_bottom_target: Mutex<Option<f64>>,
 }
 

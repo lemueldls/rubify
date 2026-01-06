@@ -18,7 +18,7 @@ pub struct PinyinRenderer<'a> {
     position: RubyPosition,
     /// baseline offset in em units to fine tune annotation baseline
     baseline_offset_em: f64,
-    /// when true, use legacy tight placement; otherwise a consistent baseline is used
+    /// when true, use tight placement; otherwise a consistent baseline is used
     tight: bool,
     /// cached consistent top target y (in main font units), computed lazily when placing Top annotations
     cached_top_target: Mutex<Option<f64>>,
