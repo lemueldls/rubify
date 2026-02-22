@@ -4,6 +4,7 @@
 
 [formatting]
 reorder_keys = false
+reorder_arrays = false
 
 [[rule]]
 include = ["**/Cargo.toml"]

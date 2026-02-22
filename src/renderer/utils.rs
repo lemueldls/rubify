@@ -1,5 +1,6 @@
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
+use atomic_float::AtomicF64;
 use fontcull_read_fonts::FontRef;
 use fontcull_skrifa::{GlyphId, MetadataProvider, instance::Size};
 use kurbo::{BezPath, Shape};
@@ -69,8 +70,8 @@ pub fn render_top_bottom(
     gutter_em: f64,
     baseline_offset_em: f64,
     tight: bool,
-    cached_top: &Mutex<Option<f64>>,
-    cached_bottom: &Mutex<Option<f64>>,
+    cached_top: &AtomicF64,
+    cached_bottom: &AtomicF64,
     mut get_adv: impl FnMut(GlyphId) -> f64,
 ) {
     let total_width = text_widths.iter().sum::<f64>();
@@ -127,30 +128,13 @@ pub fn render_top_bottom(
         }
     } else {
         if position == RubyPosition::Top {
-            let mut cached = cached_top.lock().unwrap();
-
-            if let Some(prev) = *cached {
-                let newv = prev.max(required_top_target);
-                *cached = Some(newv);
-
-                newv
-            } else {
-                *cached = Some(required_top_target);
-
-                required_top_target
-            }
+            cached_top
+                .fetch_max(required_top_target, Ordering::Relaxed)
+                .max(required_top_target)
         } else {
-            let mut cached = cached_bottom.lock().unwrap();
-            if let Some(prev) = *cached {
-                let newv = prev.min(required_bottom_target);
-                *cached = Some(newv);
-
-                newv
-            } else {
-                *cached = Some(required_bottom_target);
-
-                required_bottom_target
-            }
+            cached_bottom
+                .fetch_min(required_bottom_target, Ordering::Relaxed)
+                .min(required_bottom_target)
         }
     };
 

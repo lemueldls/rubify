@@ -1,11 +1,10 @@
-use std::sync::Mutex;
-
+use atomic_float::AtomicF64;
 use fontcull_read_fonts::{FontRef, TableProvider};
 use kurbo::{BezPath, Shape};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use romaji::RomajiExt;
+use wana_kana::ConvertJapanese;
 
-use super::{HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition, RubyRenderer, utils};
+use super::{CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition, RubyRenderer, utils};
 
 pub struct RomajiRenderer<'a> {
     font: FontRef<'a>,
@@ -21,9 +20,9 @@ pub struct RomajiRenderer<'a> {
     /// when true, use tight placement; otherwise a consistent baseline is used
     tight: bool,
     /// cached consistent top target y (in main font units), computed lazily when placing Top annotations
-    cached_top_target: Mutex<Option<f64>>,
+    cached_top_target: AtomicF64,
     /// cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
-    cached_bottom_target: Mutex<Option<f64>>,
+    cached_bottom_target: AtomicF64,
 }
 
 impl<'a> RomajiRenderer<'a> {
@@ -45,8 +44,8 @@ impl<'a> RomajiRenderer<'a> {
             position,
             baseline_offset_em,
             tight,
-            cached_top_target: Mutex::new(None),
-            cached_bottom_target: Mutex::new(None),
+            cached_top_target: AtomicF64::new(f64::NEG_INFINITY),
+            cached_bottom_target: AtomicF64::new(f64::INFINITY),
         })
     }
 }
@@ -61,9 +60,8 @@ impl<'a> RubyRenderer for RomajiRenderer<'a> {
     ) -> Result<()> {
         let kana = ch.to_string();
 
-        // Use `romaji` crate to convert the character to romaji.
         let romaji_text = kana.to_romaji();
-        if romaji_text.is_empty() || kana == romaji_text || kana == "-" {
+        if romaji_text.is_empty() || kana == romaji_text || romaji_text == "-" {
             return Ok(());
         }
 
@@ -144,6 +142,6 @@ impl<'a> RubyRenderer for RomajiRenderer<'a> {
     }
 
     fn ranges(&self) -> &[std::ops::RangeInclusive<u32>] {
-        &[HIRAGANA_RANGE, KATAKANA_RANGE]
+        &[CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE]
     }
 }

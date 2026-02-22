@@ -1,6 +1,7 @@
-use std::sync::Mutex;
+use core::f64;
 
 use ::pinyin::ToPinyin;
+use atomic_float::AtomicF64;
 use fontcull_read_fonts::{FontRef, TableProvider};
 use kurbo::{BezPath, Shape};
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -21,9 +22,9 @@ pub struct PinyinRenderer<'a> {
     /// when true, use tight placement; otherwise a consistent baseline is used
     tight: bool,
     /// cached consistent top target y (in main font units), computed lazily when placing Top annotations
-    cached_top_target: Mutex<Option<f64>>,
+    cached_top_target: AtomicF64,
     /// cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
-    cached_bottom_target: Mutex<Option<f64>>,
+    cached_bottom_target: AtomicF64,
 }
 
 impl<'a> PinyinRenderer<'a> {
@@ -45,8 +46,8 @@ impl<'a> PinyinRenderer<'a> {
             position,
             baseline_offset_em,
             tight,
-            cached_top_target: Mutex::new(None),
-            cached_bottom_target: Mutex::new(None),
+            cached_top_target: AtomicF64::new(f64::NEG_INFINITY),
+            cached_bottom_target: AtomicF64::new(f64::INFINITY),
         })
     }
 }
