@@ -22,17 +22,22 @@ struct Cli {
     #[facet(args::named, args::short = 'o')]
     out: PathBuf,
 
-    /// Separate font file to use for ruby characters
-    #[facet(args::named)]
-    font: Option<PathBuf>,
-
     /// Ruby characters. Can be repeated to enable multiple sets.
     #[facet(args::named)]
     ruby: String,
 
+    /// Separate font file to use for ruby characters
+    #[facet(args::named)]
+    font: Option<PathBuf>,
+
     /// Subset the font to include only annotation characters.
     #[facet(args::named, default = false)]
     subset: bool,
+
+    /// Convert all outputs to WOFF2
+    #[cfg(feature = "woff2")]
+    #[facet(args::named, default = false)]
+    woff2: bool,
 
     /// Where to place ruby characters relative to base glyph.
     #[facet(args::named, default = "top")]
@@ -136,11 +141,7 @@ fn main() -> Result<()> {
             .with_context(|| anyhow!("Failed to create out-dir: {:?}", cli.out))?;
     }
 
-    info!(
-        "Processing {} inputs -> {:?}...",
-        input_paths.len(),
-        cli.out
-    );
+    info!("Processing {} inputs -> {:?}", input_paths.len(), cli.out);
 
     let inputs_span = info_span!("process_fonts_in_inputs");
     inputs_span.pb_set_style(
@@ -164,19 +165,6 @@ fn main() -> Result<()> {
             .context("Invalid file name")?
             .to_string();
 
-        // // Convert to woff2 if requested
-        // let out_name = if cli.woff2 {
-        //     info!("Converting {:?} to WOFF2...", in_path);
-        //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
-        //     let stem = in_path
-        //         .file_stem()
-        //         .and_then(|s| s.to_str())
-        //         .unwrap_or(&file_name);
-        //     format!("{}.woff2", stem)
-        // } else {
-        //     file_name.clone()
-        // };
-
         let out_path = cli.out.join(file_name);
 
         process_font(&cli, &ruby, &in_path, &out_path)?;
@@ -196,7 +184,7 @@ fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
     let base_file = FileRef::new(&base_font_data)
         .map_err(|e| anyhow!("Failed to parse base font file: {:?}", e))?;
 
-    info!("Processing {:?} -> {:?}...", in_path, out_path);
+    info!("Processing {:?} -> {:?}", in_path, out_path);
 
     let ruby_font_data = if let Some(path) = &cli.font {
         fs::read(path).with_context(|| anyhow!("Failed to read ruby font file: {path:?}"))?
@@ -245,22 +233,19 @@ fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         }
     };
 
-    let mut new_font_data = rubify::process_font_file(base_file, &renderer, cli.subset)?;
+    let mut data = rubify::process_font_file(base_file, &renderer, cli.subset)?;
+    let mut path = out_path.to_owned();
 
-    // let extension = out_path
-    //     .extension()
-    //     .and_then(|ext| ext.to_str())
-    //     .map(|ext| ext.to_lowercase());
+    #[cfg(feature = "woff2")]
+    if cli.woff2 {
+        info!("Converting to WOFF2");
+        data = rubify::convert_to_woff2(&data)?;
+        path = out_path.with_extension("woff2");
+    }
 
-    // if let Some("woff2") = extension.as_deref() {
-    //     info!("Converting to WOFF2...");
-    //     new_font_data = rubify::convert_to_woff2(&new_font_data)?;
-    // }
+    fs::write(&path, data).with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
 
-    fs::write(&out_path, new_font_data)
-        .with_context(|| anyhow!("Failed to write output file: {out_path:?}"))?;
-
-    info!("Wrote {:?}", out_path);
+    info!("Wrote {path:?}");
 
     Ok(())
 }
