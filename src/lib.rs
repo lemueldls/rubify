@@ -334,20 +334,3 @@ pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -
 pub fn convert_to_woff2(font_data: &[u8]) -> Result<Vec<u8>> {
     woofwoof::compress(font_data, &[], 11, true).context("WOFF2 compression failed")
 }
-
-fn get_all_name_records(font: &FontRef) -> Result<Vec<(NameId, String)>> {
-    let name_table = font.name().context("No name table found")?;
-    let string_data = name_table.string_data();
-
-    let records = name_table
-        .name_record()
-        .iter()
-        .filter_map(|rec| {
-            rec.string(string_data)
-                .ok()
-                .map(|s| (rec.name_id(), s.to_string()))
-        })
-        .collect();
-
-    Ok(records)
-}

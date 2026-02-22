@@ -3,7 +3,8 @@ name = "rubify"
 version = "0.1.0"
 description = "Add ruby characters to fonts."
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/lemueldls/rubify"
 
 [features]
 default = ["pinyin", "romaji", "woff2"]
@@ -15,7 +16,7 @@ woff2 = ["dep:woofwoof"]
 anyhow = "1.0"
 atomic_float = "1.1.0"
 facet = { git = "https://github.com/facet-rs/facet", branch = "main", version = "0.43" }
-figue = { git = "https://github.com/bearcove/figue" }
+figue = { git = "https://github.com/bearcove/figue", branch = "main", version = "1.0.0" }
 fontcull = { version = "2.0", default-features = false }
 fontcull-font-types = "0.10"
 fontcull-klippa = "0.1"
