@@ -23,14 +23,25 @@ rubify <input-file-or-glob> -o <out-dir> --ruby <pinyin|romaji> [options]
 - `--subset`: Subset output font to contain only annotation characters
 - `--split`: When input is a TTC, write each font as a separate TTF file instead of rebuilding a TTC
 - `--woff2`: Convert outputs to WOFF2
+- `--position <top|bottom|leftdown|leftup|rightdown|rightup>`: Where to place ruby annotations relative to the base glyph. Valid values:
+  - `top` (default): place annotation above the base glyph
+  - `bottom`: place annotation below the base glyph
+  - `leftdown`: place annotation to the left, stacking downwards
+  - `leftup`: place annotation to the left, stacking upwards
+  - `rightdown`: place annotation to the right, stacking downwards
+  - `rightup`: place annotation to the right, stacking upwards
 
-### Example
-
-Process a single TTC, split into TTFs, subset and output WOFF2:
+### Examples
 
 ```sh
-rubify Sarasa-Regular.ttc -o dist --font iosevka/IosevkaSlim-Regular.ttf --subset --ruby romaji --position bottom --split --woff2
+rubify Sarasa-Regular.ttc -o dist --ruby pinyin
 ```
+
+```sh
+rubify *.ttc -o dist --font iosevka/IosevkaSlim-Regular.ttf --ruby romaji --position bottom --split --woff2
+```
+
+![Example](example.png)
 
 ## License
 
