@@ -114,7 +114,8 @@ mod tests {
     #[test]
     fn test_ttc_roundtrip() -> Result<()> {
         // Include the TTC file
-        let input_data = include_bytes!("../tests/Sarasa-Regular.ttc");
+        let input_data =
+            std::fs::read("Sarasa-Regular.ttc").context("Failed to read input TTC file")?;
 
         // Parse input TTC
         let input_file = FileRef::new(&input_data[..]).context("Failed to parse input TTC file")?;
