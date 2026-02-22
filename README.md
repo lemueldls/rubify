@@ -7,7 +7,7 @@
 - Optionally split TTC into individual TTF files
 - Optional WOFF2 output (feature-flagged, currently only supported when splitting collections)
 
-## Library usage
+## Library Usage
 
 See the [rubify](https://docs.rs/rubify) crate documentation for API details and examples.
 
@@ -47,7 +47,7 @@ rubify *.ttc -o dist --font iosevka/IosevkaSlim-Regular.ttf --ruby romaji --posi
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 
 at your option.
