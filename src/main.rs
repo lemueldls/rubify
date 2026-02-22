@@ -34,6 +34,10 @@ struct Cli {
     #[facet(args::named, default = false)]
     subset: bool,
 
+    /// Split font collection (TTC) into separate TTF files instead of rebuilding as TTC.
+    #[facet(args::named, default = false)]
+    split: bool,
+
     /// Convert all outputs to WOFF2
     #[cfg(feature = "woff2")]
     #[facet(args::named, default = false)]
@@ -141,6 +145,13 @@ fn main() -> Result<()> {
             .with_context(|| anyhow!("Failed to create out-dir: {:?}", cli.out))?;
     }
 
+    #[cfg(feature = "woff2")]
+    if cli.woff2 && !cli.split {
+        anyhow::bail!(
+            "WOFF2 output is only supported when --split is enabled, because we don't currently support converting TTC collections to WOFF2. Please enable --split or disable --woff2."
+        );
+    }
+
     info!("Processing {} inputs -> {:?}", input_paths.len(), cli.out);
 
     let inputs_span = info_span!("process_fonts_in_inputs");
@@ -167,7 +178,7 @@ fn main() -> Result<()> {
 
         let out_path = cli.out.join(file_name);
 
-        process_font(&cli, &ruby, &in_path, &out_path)?;
+        process_file(&cli, &ruby, &in_path, &out_path)?;
     }
 
     drop(inputs_span_enter);
@@ -178,7 +189,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
+fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
     let base_font_data =
         fs::read(in_path).with_context(|| anyhow!("Failed to read input file: {in_path:?}"))?;
     let base_file = FileRef::new(&base_font_data)
@@ -233,19 +244,23 @@ fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         }
     };
 
-    let mut data = rubify::process_font_file(base_file, &renderer, cli.subset)?;
-    let mut path = out_path.to_owned();
+    let fonts = rubify::process_font_file(base_file, &renderer, cli.subset, cli.split)?;
 
-    #[cfg(feature = "woff2")]
-    if cli.woff2 {
-        info!("Converting to WOFF2");
-        data = rubify::convert_to_woff2(&data)?;
-        path = out_path.with_extension("woff2");
+    for font in fonts {
+        let mut data = font.data;
+        let mut path = out_path.to_owned();
+
+        #[cfg(feature = "woff2")]
+        if cli.woff2 {
+            info!("Converting to WOFF2");
+            data = rubify::convert_to_woff2(&data)?;
+            path = out_path.with_extension("woff2");
+        }
+
+        fs::write(&path, data).with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
+
+        info!("Wrote {path:?}");
     }
-
-    fs::write(&path, data).with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
-
-    info!("Wrote {path:?}");
 
     Ok(())
 }

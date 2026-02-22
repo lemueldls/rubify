@@ -29,66 +29,134 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{pen::PathPen, renderer::RubyRenderer};
 
+pub struct ProcessedFont {
+    pub data: Vec<u8>,
+    pub file_name: Option<String>,
+}
+
 pub fn process_font_file(
     file: FileRef,
     renderer: &Box<dyn RubyRenderer>,
     subset: bool,
-) -> Result<Vec<u8>> {
+    split: bool,
+) -> Result<Vec<ProcessedFont>> {
     match file {
         FileRef::Font(font) => {
-            let data = process_font_ref(font, &renderer)?;
-
-            if subset {
+            let data = process_font_ref(&font, &renderer)?;
+            let data = if subset {
                 info!("Subsetting font");
 
-                subset_by_renderers(&data, &renderer)
+                subset_by_renderers(&data, &renderer)?
             } else {
-                Ok(data)
-            }
+                data
+            };
+
+            Ok(vec![ProcessedFont {
+                data,
+                file_name: None,
+            }])
         }
         FileRef::Collection(collection) => {
-            let collection_span = info_span!("process_fonts_in_collection");
-            collection_span.pb_set_style(
-                &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}")
-                    .unwrap(),
-            );
-            collection_span.pb_set_length(collection.len() as u64);
-            collection_span.pb_set_message("Processing collection");
+            if split {
+                // Split mode: write each font as a separate TTF file
+                let collection_span = info_span!("split_fonts_in_collection");
+                collection_span.pb_set_style(
+                    &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}")
+                        .unwrap(),
+                );
+                collection_span.pb_set_length(collection.len() as u64);
+                collection_span.pb_set_message("Splitting collection");
 
-            let process_span_enter = collection_span.enter();
+                let split_span_enter = collection_span.enter();
 
-            let fonts = collection
-                .iter()
-                .par_bridge()
-                .map(|font| {
-                    collection_span.pb_inc(1);
-                    collection_span.pb_set_message("Processing font");
+                let fonts = collection
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, font)| {
+                        collection_span.pb_inc(1);
 
-                    let font = font.context("Failed to read font")?;
+                        let font = font.context("Failed to read font")?;
+                        let mut data = process_font_ref(&font, &renderer)?;
 
-                    let mut data = process_font_ref(font, &renderer)?;
+                        if subset {
+                            collection_span.pb_set_message("Subsetting font");
+                            data = subset_by_renderers(&data, &renderer)?;
+                        }
 
-                    if subset {
-                        collection_span.pb_set_message("Subsetting font");
-                        data = subset_by_renderers(&data, &renderer)?;
-                    }
+                        // Generate output filename
+                        let file_name = if let Ok(name_table) = font.name() {
+                            // Try to get family name from name table
+                            name_table
+                                .name_record()
+                                .iter()
+                                .find(|n| n.name_id() == NameId::POSTSCRIPT_NAME)
+                                .and_then(|rec| rec.string(name_table.string_data()).ok())
+                                .map(|name| format!("{name}.ttf"))
+                                .unwrap_or_else(|| format!("font-{idx}.ttf"))
+                        } else {
+                            format!("font-{idx}.ttf")
+                        };
 
-                    let data = Box::leak(data.into_boxed_slice());
+                        Ok(ProcessedFont {
+                            data,
+                            file_name: Some(file_name),
+                        })
+                    })
+                    .collect::<Result<Vec<ProcessedFont>>>();
 
-                    FontRef::new(data).context("Failed to create font ref")
-                })
-                .collect::<Result<Vec<FontRef>>>()?;
+                drop(split_span_enter);
+                drop(collection_span);
 
-            drop(process_span_enter);
+                fonts
+            } else {
+                let collection_span = info_span!("process_fonts_in_collection");
+                collection_span.pb_set_style(
+                    &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}")
+                        .unwrap(),
+                );
+                collection_span.pb_set_length(collection.len() as u64);
+                collection_span.pb_set_message("Processing collection");
 
-            info_span!("Building TTC");
+                let process_span_enter = collection_span.enter();
 
-            ttc::build_collection(&fonts)
+                let fonts = collection
+                    .iter()
+                    .par_bridge()
+                    .map(|font| {
+                        collection_span.pb_inc(1);
+                        collection_span.pb_set_message("Processing font");
+
+                        let font = font.context("Failed to read font")?;
+
+                        let mut data = process_font_ref(&font, &renderer)?;
+
+                        if subset {
+                            collection_span.pb_set_message("Subsetting font");
+                            data = subset_by_renderers(&data, &renderer)?;
+                        }
+
+                        let data = Box::leak(data.into_boxed_slice());
+
+                        FontRef::new(data).context("Failed to create font ref")
+                    })
+                    .collect::<Result<Vec<FontRef>>>()?;
+
+                drop(process_span_enter);
+
+                info_span!("Building TTC");
+
+                let data = ttc::build_collection(&fonts).context("Failed to build TTC")?;
+
+                Ok(vec![ProcessedFont {
+                    data,
+                    file_name: None,
+                }])
+            }
         }
     }
 }
 
-pub fn process_font_ref(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
+pub fn process_font_ref(font: &FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx()?;
@@ -265,4 +333,21 @@ pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -
 #[cfg(feature = "woff2")]
 pub fn convert_to_woff2(font_data: &[u8]) -> Result<Vec<u8>> {
     woofwoof::compress(font_data, &[], 11, true).context("WOFF2 compression failed")
+}
+
+fn get_all_name_records(font: &FontRef) -> Result<Vec<(NameId, String)>> {
+    let name_table = font.name().context("No name table found")?;
+    let string_data = name_table.string_data();
+
+    let records = name_table
+        .name_record()
+        .iter()
+        .filter_map(|rec| {
+            rec.string(string_data)
+                .ok()
+                .map(|s| (rec.name_id(), s.to_string()))
+        })
+        .collect();
+
+    Ok(records)
 }
