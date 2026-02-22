@@ -1,7 +1,5 @@
 pub mod renderer;
 
-use std::ops::RangeInclusive;
-
 use fontcull_font_types::NameId;
 use fontcull_klippa::{Plan, SubsetFlags, subset_font};
 use fontcull_read_fonts::{
@@ -32,13 +30,9 @@ use woofwoof;
 
 use crate::renderer::RubyRenderer;
 
-pub fn process_font_file(
-    file: FileRef,
-    char_ranges: &[RangeInclusive<u32>],
-    renderers: &[Box<dyn RubyRenderer>],
-) -> Result<Vec<u8>> {
+pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     match file {
-        FileRef::Font(font) => process_single_font(font, char_ranges, renderers),
+        FileRef::Font(font) => process_single_font(font, &renderer),
         FileRef::Collection(collection) => {
             let head = collection
                 .iter()
@@ -50,13 +44,11 @@ pub fn process_font_file(
 
             let collection_span = info_span!("process_fonts_in_collection");
             collection_span.pb_set_style(
-                &ProgressStyle::with_template(
-                    "[{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} {msg}",
-                )
-                .unwrap(),
+                &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}")
+                    .unwrap(),
             );
             collection_span.pb_set_length(collection.len() as u64);
-            collection_span.pb_set_message("Processing font collection");
+            collection_span.pb_set_message("Processing collection");
 
             let process_span_enter = collection_span.enter();
 
@@ -68,7 +60,7 @@ pub fn process_font_file(
 
                     let font = font.map_err(|err| miette!("Failed to read font: {err:?}"))?;
 
-                    let data = process_single_font(font, char_ranges, renderers)?;
+                    let data = process_single_font(font, &renderer)?;
                     let data = Box::leak(data.into_boxed_slice());
 
                     FontRef::new(data).into_diagnostic()
@@ -82,11 +74,7 @@ pub fn process_font_file(
     }
 }
 
-fn process_single_font(
-    font: FontRef,
-    char_ranges: &[RangeInclusive<u32>],
-    renderers: &[Box<dyn RubyRenderer>],
-) -> Result<Vec<u8>> {
+fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx().into_diagnostic()?;
@@ -94,7 +82,8 @@ fn process_single_font(
     let outlines = font.outline_glyphs();
     let upem = font.head().into_diagnostic()?.units_per_em() as f64;
 
-    let gid_char_map = char_ranges
+    let gid_char_map = renderer
+        .ranges()
         .iter()
         .cloned()
         .flat_map(|range| {
@@ -159,17 +148,15 @@ fn process_single_font(
         }
 
         if let Some(&ch) = gid_char_map.get(&gid) {
-            for renderer in renderers {
-                let orig_advance = hmtx
-                    .h_metrics()
-                    .get(gid.to_u32() as usize)
-                    .map(|m| m.advance.get())
-                    .unwrap_or(upem as u16) as f64;
+            let orig_advance = hmtx
+                .h_metrics()
+                .get(gid.to_u32() as usize)
+                .map(|m| m.advance.get())
+                .unwrap_or(upem as u16) as f64;
 
-                renderer
-                    .annotate(ch, &mut final_path, orig_advance, upem)
-                    .wrap_err("Failed to annotate")?;
-            }
+            renderer
+                .annotate(ch, &mut final_path, orig_advance, upem)
+                .wrap_err("Failed to annotate")?;
         }
 
         let write_glyph = if !has_content && final_path.elements().is_empty() {
@@ -233,10 +220,7 @@ fn process_single_font(
     Ok(font_builder.build())
 }
 
-pub fn subset_by_renderers(
-    font_data: &[u8],
-    renderers: &[Box<dyn RubyRenderer>],
-) -> Result<Vec<u8>> {
+pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     let file =
         FileRef::new(font_data).map_err(|_| miette!("Failed to parse font for subsetting"))?;
     let font = file
@@ -248,11 +232,9 @@ pub fn subset_by_renderers(
     // Build unicodes set based on provided character sets
     let mut unicodes = IntSet::<u32>::empty();
 
-    for renderer in renderers {
-        for range in renderer.ranges() {
-            for c in range.clone() {
-                unicodes.insert(c);
-            }
+    for range in renderer.ranges() {
+        for c in range.clone() {
+            unicodes.insert(c);
         }
     }
 
