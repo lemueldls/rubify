@@ -1,7 +1,7 @@
+use anyhow::{Context, Result};
 use atomic_float::AtomicF64;
 use fontcull_read_fonts::{FontRef, TableProvider};
 use kurbo::{BezPath, Shape};
-use miette::{IntoDiagnostic, Result, WrapErr};
 use wana_kana::ConvertJapanese;
 
 use super::{CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition, RubyRenderer, utils};
@@ -34,7 +34,7 @@ impl<'a> RomajiRenderer<'a> {
         baseline_offset_em: f64,
         tight: bool,
     ) -> Result<Self> {
-        let upem = font.head().into_diagnostic()?.units_per_em() as f64;
+        let upem = font.head()?.units_per_em() as f64;
 
         Ok(Self {
             font,
@@ -65,11 +65,7 @@ impl<'a> RubyRenderer for RomajiRenderer<'a> {
             return Ok(());
         }
 
-        let hmtx = self
-            .font
-            .hmtx()
-            .into_diagnostic()
-            .wrap_err("Missing romaji font hmtx")?;
+        let hmtx = self.font.hmtx().context("Missing romaji font hmtx")?;
 
         let glyph_paths = match utils::collect_glyph_paths(&self.font, romaji_text) {
             Some(p) => p,

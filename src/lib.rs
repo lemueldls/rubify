@@ -1,5 +1,6 @@
 pub mod renderer;
 
+use anyhow::{Context, Result, anyhow};
 use fontcull_font_types::NameId;
 use fontcull_klippa::{Plan, SubsetFlags, subset_font};
 use fontcull_read_fonts::{
@@ -21,7 +22,6 @@ use fontcull_write_fonts::{
 };
 use indicatif::ProgressStyle;
 use kurbo::BezPath;
-use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use rustc_hash::FxHashMap;
 use tracing::info_span;
@@ -37,8 +37,7 @@ pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Res
             let head = collection
                 .iter()
                 .next()
-                .wrap_err("No fonts in collection")?
-                .into_diagnostic()?;
+                .context("No fonts in collection")??;
 
             let family_name = get_family_name(&head).unwrap();
 
@@ -58,12 +57,12 @@ pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Res
                 .map(|font| {
                     collection_span.pb_inc(1);
 
-                    let font = font.map_err(|err| miette!("Failed to read font: {err:?}"))?;
+                    let font = font.context("Failed to read font")?;
 
                     let data = process_single_font(font, &renderer)?;
                     let data = Box::leak(data.into_boxed_slice());
 
-                    FontRef::new(data).into_diagnostic()
+                    FontRef::new(data).context("Failed to create font ref")
                 })
                 .collect::<Result<Vec<FontRef>>>()?;
 
@@ -77,10 +76,10 @@ pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Res
 fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
-    let hmtx = font.hmtx().into_diagnostic()?;
-    let maxp = font.maxp().into_diagnostic()?;
+    let hmtx = font.hmtx()?;
+    let maxp = font.maxp()?;
     let outlines = font.outline_glyphs();
-    let upem = font.head().into_diagnostic()?.units_per_em() as f64;
+    let upem = font.head()?.units_per_em() as f64;
 
     let gid_char_map = renderer
         .ranges()
@@ -111,8 +110,7 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
 
     let progress_style = ProgressStyle::with_template(
         "{spinner:.green} {msg} {wide_bar:.cyan/blue} {pos:>7}/{len:7}",
-    )
-    .into_diagnostic()?
+    )?
     .progress_chars("##-");
 
     let glyphs_span = info_span!("process_glyphs");
@@ -156,7 +154,7 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
 
             renderer
                 .annotate(ch, &mut final_path, orig_advance, upem)
-                .wrap_err("Failed to annotate")?;
+                .context("Failed to annotate")?;
         }
 
         let write_glyph = if !has_content && final_path.elements().is_empty() {
@@ -168,9 +166,7 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
             }
         };
 
-        glyf_loca_builder
-            .add_glyph(&write_glyph)
-            .into_diagnostic()?;
+        glyf_loca_builder.add_glyph(&write_glyph)?;
     }
 
     drop(glyphs_span_enter);
@@ -197,8 +193,7 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
 
                 font_builder
                     .add_table(&head)
-                    .into_diagnostic()
-                    .wrap_err("Failed to add head table")?;
+                    .context("Failed to add head table")?;
             }
 
             continue;
@@ -211,23 +206,20 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
 
     font_builder
         .add_table(&glyf_data)
-        .into_diagnostic()
-        .wrap_err("Failed to add glyf table")?
+        .context("Failed to add glyf table")?
         .add_table(&loca_data)
-        .into_diagnostic()
-        .wrap_err("Failed to add loca table")?;
+        .context("Failed to add loca table")?;
 
     Ok(font_builder.build())
 }
 
 pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
-    let file =
-        FileRef::new(font_data).map_err(|_| miette!("Failed to parse font for subsetting"))?;
+    let file = FileRef::new(font_data).context("Failed to parse font for subsetting")?;
     let font = file
         .fonts()
         .next()
-        .wrap_err("No font found for subsetting")?
-        .map_err(|e| miette!("Read error: {:?}", e))?;
+        .context("No font found for subsetting")?
+        .context("Read error")?;
 
     // Build unicodes set based on provided character sets
     let mut unicodes = IntSet::<u32>::empty();
@@ -257,11 +249,11 @@ pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -
         &name_languages,
     );
 
-    subset_font(&font, &plan).map_err(|e| miette!("Subset error: {:?}", e))
+    subset_font(&font, &plan).context("Subset error")
 }
 
 pub fn convert_to_woff2(font_data: &[u8]) -> Result<Vec<u8>> {
-    woofwoof::compress(font_data, &[], 11, true).ok_or_else(|| miette!("WOFF2 compression failed"))
+    woofwoof::compress(font_data, &[], 11, true).context("WOFF2 compression failed")
 }
 
 pub struct PathPen {
@@ -341,13 +333,13 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
             let tag = record.tag();
             let mut data = font
                 .table_data(tag)
-                .ok_or_else(|| miette!("Table missing"))?
+                .context("Table missing")?
                 .as_ref()
                 .to_vec();
 
             // Rewrite name table
             if tag == Name::TAG {
-                let name_table = font.name().into_diagnostic()?;
+                let name_table = font.name()?;
                 let mut new_name = Name::from_obj_ref(&name_table, font.data());
 
                 for rec in new_name.name_record.iter_mut() {
@@ -359,7 +351,7 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
                     }
                 }
 
-                data = dump_table(&new_name).into_diagnostic()?;
+                data = dump_table(&new_name)?;
             }
 
             // Only share tables that are usually safe and heavy
@@ -407,15 +399,12 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
     }
 
     for &f_off in &font_offsets {
-        let num_tables = u16::from_be_bytes(
-            out[f_off as usize + 4..f_off as usize + 6]
-                .try_into()
-                .into_diagnostic()?,
-        );
+        let num_tables =
+            u16::from_be_bytes(out[f_off as usize + 4..f_off as usize + 6].try_into()?);
 
         for i in 0..num_tables {
             let off_pos = (f_off as usize + 12) + (i as usize * 16) + 8;
-            let rel = u32::from_be_bytes(out[off_pos..off_pos + 4].try_into().into_diagnostic()?);
+            let rel = u32::from_be_bytes(out[off_pos..off_pos + 4].try_into()?);
             out[off_pos..off_pos + 4].copy_from_slice(&(data_block_start + rel).to_be_bytes());
         }
     }

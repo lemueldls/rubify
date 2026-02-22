@@ -1,10 +1,10 @@
 use core::f64;
 
 use ::pinyin::ToPinyin;
+use anyhow::{Context, Result};
 use atomic_float::AtomicF64;
 use fontcull_read_fonts::{FontRef, TableProvider};
 use kurbo::{BezPath, Shape};
-use miette::{IntoDiagnostic, Result, WrapErr};
 
 use super::{CJK_RANGE, RubyPosition, RubyRenderer, utils};
 
@@ -36,7 +36,7 @@ impl<'a> PinyinRenderer<'a> {
         baseline_offset_em: f64,
         tight: bool,
     ) -> Result<Self> {
-        let upem = font.head().into_diagnostic()?.units_per_em() as f64;
+        let upem = font.head()?.units_per_em() as f64;
 
         Ok(Self {
             font,
@@ -63,11 +63,7 @@ impl<'a> RubyRenderer for PinyinRenderer<'a> {
         if let Some(p) = ch.to_pinyin() {
             let pinyin_text = p.with_tone().to_string();
 
-            let hmtx = self
-                .font
-                .hmtx()
-                .into_diagnostic()
-                .wrap_err("Missing pinyin font hmtx")?;
+            let hmtx = self.font.hmtx().context("Missing pinyin font hmtx")?;
 
             let parts_paths = match utils::collect_glyph_paths(&self.font, pinyin_text) {
                 Some(p) => p,

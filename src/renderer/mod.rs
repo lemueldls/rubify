@@ -6,12 +6,11 @@ pub mod utils;
 
 use std::ops::RangeInclusive;
 
+use anyhow::Result;
 use facet::Facet;
 use kurbo::BezPath;
-use miette::Result;
 
-/// A pluggable renderer that can add "ruby" annotations (small text above characters).
-/// Implementations (such as pinyin) will be provided behind features.
+/// A pluggable renderer that can add "ruby" annotations.
 pub trait RubyRenderer: Send + Sync {
     /// Given a base character `ch`, add annotation paths (if any) into `final_path`.
     /// `orig_advance` is the glyph advance in font units; `main_upem` is the main font UPEM.

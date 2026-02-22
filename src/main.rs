@@ -1,11 +1,11 @@
 use std::{fs, path::PathBuf, str::FromStr};
 
+use anyhow::{Context, Error, Result, anyhow};
 use facet::Facet;
-use facet_args as args;
+use figue::{self as args, FigueBuiltins};
 use fontcull_read_fonts::FileRef;
 use glob::glob;
 use indicatif::ProgressStyle;
-use miette::{Error, IntoDiagnostic, Result, WrapErr, miette};
 use rubify::renderer::{self, RubyPosition, RubyRenderer};
 use rustc_hash::FxHashSet;
 use tracing::{info, info_span};
@@ -20,7 +20,7 @@ struct Cli {
 
     /// Output directory
     #[facet(args::named, args::short = 'o')]
-    out_dir: PathBuf,
+    out: PathBuf,
 
     /// Optional font file to use for ruby characters
     #[facet(args::named)]
@@ -52,7 +52,11 @@ struct Cli {
 
     /// Fine-tune baseline offset (in em units). Positive moves annotation further away from base glyph.
     #[facet(args::named, default = 0.0)]
-    baseline_offset: f64,
+    offset: f64,
+
+    /// Standard CLI options (--help, --version, --completions)
+    #[facet(flatten)]
+    builtins: FigueBuiltins,
 }
 
 pub enum Ruby {
@@ -72,13 +76,13 @@ impl FromStr for Ruby {
             #[cfg(feature = "romaji")]
             "romaji" => Ok(Ruby::Romaji),
             other => {
-                return Err(miette!("Unknown ruby characters argument: {}", other));
+                return Err(anyhow!("Unknown ruby characters argument: {other}"));
             }
         }
     }
 }
 
-fn position_from_str(s: &str) -> Result<RubyPosition, miette::Error> {
+fn position_from_str(s: &str) -> Result<RubyPosition> {
     match s.to_lowercase().as_str() {
         "top" => Ok(RubyPosition::Top),
         "bottom" => Ok(RubyPosition::Bottom),
@@ -86,7 +90,7 @@ fn position_from_str(s: &str) -> Result<RubyPosition, miette::Error> {
         "leftup" => Ok(RubyPosition::LeftUp),
         "rightdown" => Ok(RubyPosition::RightDown),
         "rightup" => Ok(RubyPosition::RightUp),
-        other => Err(miette!("Unknown ruby position argument: {}", other)),
+        other => Err(anyhow!("Unknown ruby position argument: {other}")),
     }
 }
 
@@ -102,17 +106,16 @@ fn main() -> Result<()> {
         .with(indicatif_layer)
         .init();
 
-    let cli: Cli = args::from_std_args()?;
+    let cli: Cli = args::from_std_args().unwrap();
 
     let ruby = Ruby::from_str(&cli.ruby)
-        .wrap_err_with(|| miette!("Failed to parse --ruby argument: {}", &cli.ruby))?;
+        .with_context(|| anyhow!("Failed to parse --ruby argument: {}", &cli.ruby))?;
 
     let mut input_paths: FxHashSet<PathBuf> = FxHashSet::default();
 
     for pattern in &cli.inputs {
-        let entries = glob(pattern)
-            .into_diagnostic()
-            .wrap_err_with(|| miette!("Failed to expand glob pattern: {pattern:?}"))?;
+        let entries =
+            glob(pattern).with_context(|| anyhow!("Failed to expand glob pattern: {pattern:?}"))?;
 
         for entry in entries {
             match entry {
@@ -125,19 +128,18 @@ fn main() -> Result<()> {
     }
 
     if input_paths.is_empty() {
-        return Err(miette!("No input files found"));
+        return Err(anyhow!("No input files found"));
     }
 
-    if !cli.out_dir.exists() {
-        fs::create_dir_all(&cli.out_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| miette!("Failed to create out-dir: {:?}", cli.out_dir))?;
+    if !cli.out.exists() {
+        fs::create_dir_all(&cli.out)
+            .with_context(|| anyhow!("Failed to create out-dir: {:?}", cli.out))?;
     }
 
     info!(
         "Processing {} inputs -> {:?}...",
         input_paths.len(),
-        cli.out_dir
+        cli.out
     );
 
     let inputs_span = info_span!("process_fonts_in_inputs");
@@ -159,7 +161,7 @@ fn main() -> Result<()> {
         let file_name = in_path
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| miette!("Invalid file name"))?
+            .context("Invalid file name")?
             .to_string();
 
         // // Convert to woff2 if requested
@@ -175,7 +177,7 @@ fn main() -> Result<()> {
         //     file_name.clone()
         // };
 
-        let out_path = cli.out_dir.join(file_name);
+        let out_path = cli.out.join(file_name);
 
         process_font(&cli, &ruby, &in_path, &out_path)?;
     }
@@ -188,40 +190,31 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn process_font(
-    cli: &Cli,
-    ruby: &Ruby,
-    in_path: &PathBuf,
-    out_path: &PathBuf,
-) -> Result<(), miette::Error> {
-    let base_font_data = fs::read(in_path)
-        .into_diagnostic()
-        .wrap_err_with(|| miette!("Failed to read input file: {:?}", in_path))?;
+fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -> Result<()> {
+    let base_font_data =
+        fs::read(in_path).with_context(|| anyhow!("Failed to read input file: {in_path:?}"))?;
     let base_file = FileRef::new(&base_font_data)
-        .map_err(|e| miette!("Failed to parse base font file: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to parse base font file: {:?}", e))?;
 
     info!("Processing {:?} -> {:?}...", in_path, out_path);
 
     let ruby_font_data = if let Some(path) = &cli.font {
-        fs::read(path)
-            .into_diagnostic()
-            .wrap_err_with(|| miette!("Failed to read ruby font file: {:?}", path))?
+        fs::read(path).with_context(|| anyhow!("Failed to read ruby font file: {path:?}"))?
     } else {
         base_font_data.clone()
     };
 
     let ruby_font_data = Box::leak(ruby_font_data.into_boxed_slice());
-    let ruby_file = FileRef::new(ruby_font_data)
-        .map_err(|e| miette!("Failed to parse ruby font file: {:?}", e))?;
+    let ruby_file = FileRef::new(ruby_font_data).context("Failed to parse ruby font file")?;
     let ruby_fonts: Vec<_> = ruby_file.fonts().collect();
 
     if ruby_fonts.is_empty() {
-        return Err(miette!("No fonts found in ruby font file"));
+        return Err(anyhow!("No fonts found in ruby font file"));
     }
 
     let ruby_font = ruby_fonts[0]
         .clone()
-        .map_err(|e| miette!("Failed to load font from ruby font file: {:?}", e))?;
+        .context("Failed to load font from ruby font file")?;
 
     let renderer: Box<dyn RubyRenderer> = match ruby {
         #[cfg(feature = "pinyin")]
@@ -231,7 +224,7 @@ fn process_font(
                 cli.scale,
                 cli.gutter,
                 position_from_str(&cli.position)?,
-                cli.baseline_offset,
+                cli.offset,
                 cli.tight,
             )?;
 
@@ -244,7 +237,7 @@ fn process_font(
                 cli.scale,
                 cli.gutter,
                 position_from_str(&cli.position)?,
-                cli.baseline_offset,
+                cli.offset,
                 cli.tight,
             )?;
 
@@ -270,8 +263,7 @@ fn process_font(
     // }
 
     fs::write(&out_path, new_font_data)
-        .into_diagnostic()
-        .wrap_err_with(|| miette!("Failed to write output file: {:?}", out_path))?;
+        .with_context(|| anyhow!("Failed to write output file: {out_path:?}"))?;
 
     info!("Wrote {:?}", out_path);
 
