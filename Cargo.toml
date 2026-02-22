@@ -16,7 +16,7 @@ woff2 = ["dep:woofwoof"]
 anyhow = "1.0"
 atomic_float = "1.1.0"
 facet = { git = "https://github.com/facet-rs/facet", branch = "main", version = "0.43" }
-figue = { git = "https://github.com/bearcove/figue", rev = "96733218" }
+figue = { git = "https://github.com/bearcove/figue", rev = "96733218", version = "1.0.0" }
 fontcull = { version = "2.0", default-features = false }
 fontcull-font-types = "0.10"
 fontcull-klippa = "0.1"
