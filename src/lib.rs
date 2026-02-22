@@ -1,6 +1,6 @@
 pub mod renderer;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use fontcull_font_types::NameId;
 use fontcull_klippa::{Plan, SubsetFlags, subset_font};
 use fontcull_read_fonts::{
@@ -11,36 +11,42 @@ use fontcull_read_fonts::{
 };
 use fontcull_skrifa::{MetadataProvider, outline::OutlinePen};
 use fontcull_write_fonts::{
-    FontBuilder, dump_table,
-    from_obj::{FromObjRef, ToOwnedObj},
+    FontBuilder,
+    from_obj::ToOwnedObj,
     tables::{
         glyf::{Glyf, GlyfLocaBuilder, Glyph, SimpleGlyph},
         head::Head,
         loca::Loca,
-        name::Name,
     },
 };
 use indicatif::ProgressStyle;
 use kurbo::BezPath;
 use rayon::iter::{ParallelBridge, ParallelIterator};
 use rustc_hash::FxHashMap;
-use tracing::info_span;
+use tracing::{info, info_span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use woofwoof;
 
 use crate::renderer::RubyRenderer;
 
-pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
+pub fn process_font_file(
+    file: FileRef,
+    renderer: &Box<dyn RubyRenderer>,
+    subset: bool,
+) -> Result<Vec<u8>> {
     match file {
-        FileRef::Font(font) => process_single_font(font, &renderer),
+        FileRef::Font(font) => {
+            let data = process_font_ref(font, &renderer)?;
+
+            if subset {
+                info!("Subsetting font...");
+
+                subset_by_renderers(&data, &renderer)
+            } else {
+                Ok(data)
+            }
+        }
         FileRef::Collection(collection) => {
-            let head = collection
-                .iter()
-                .next()
-                .context("No fonts in collection")??;
-
-            let family_name = get_family_name(&head).unwrap();
-
             let collection_span = info_span!("process_fonts_in_collection");
             collection_span.pb_set_style(
                 &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}")
@@ -59,7 +65,13 @@ pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Res
 
                     let font = font.context("Failed to read font")?;
 
-                    let data = process_single_font(font, &renderer)?;
+                    let mut data = process_font_ref(font, &renderer)?;
+
+                    if subset {
+                        info!("Subsetting font...");
+                        data = subset_by_renderers(&data, &renderer)?;
+                    }
+
                     let data = Box::leak(data.into_boxed_slice());
 
                     FontRef::new(data).context("Failed to create font ref")
@@ -68,12 +80,12 @@ pub fn process_font_file(file: FileRef, renderer: &Box<dyn RubyRenderer>) -> Res
 
             drop(process_span_enter);
 
-            build_ttc(&fonts, &family_name)
+            build_ttc(&fonts)
         }
     }
 }
 
-fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
+pub fn process_font_ref(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
     let font_file_data = font.table_directory.offset_data();
     let charmap = font.charmap();
     let hmtx = font.hmtx()?;
@@ -214,12 +226,7 @@ fn process_single_font(font: FontRef, renderer: &Box<dyn RubyRenderer>) -> Resul
 }
 
 pub fn subset_by_renderers(font_data: &[u8], renderer: &Box<dyn RubyRenderer>) -> Result<Vec<u8>> {
-    let file = FileRef::new(font_data).context("Failed to parse font for subsetting")?;
-    let font = file
-        .fonts()
-        .next()
-        .context("No font found for subsetting")?
-        .context("Read error")?;
+    let font = FontRef::new(font_data).context("Failed to parse font for subsetting")?;
 
     // Build unicodes set based on provided character sets
     let mut unicodes = IntSet::<u32>::empty();
@@ -295,7 +302,7 @@ impl OutlinePen for PathPen {
     }
 }
 
-pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
+pub fn build_ttc(fonts: &[FontRef]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
 
     // TTC header
@@ -331,34 +338,17 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
 
         for record in records {
             let tag = record.tag();
-            let mut data = font
+            let table_data = font
                 .table_data(tag)
                 .context("Table missing")?
                 .as_ref()
                 .to_vec();
 
-            // Rewrite name table
-            if tag == Name::TAG {
-                let name_table = font.name()?;
-                let mut new_name = Name::from_obj_ref(&name_table, font.data());
-
-                for rec in new_name.name_record.iter_mut() {
-                    match rec.name_id {
-                        NameId::FAMILY_NAME => {
-                            rec.string = family_name.to_string().into();
-                        }
-                        _ => {}
-                    }
-                }
-
-                data = dump_table(&new_name)?;
-            }
-
             // Only share tables that are usually safe and heavy
             let can_share = matches!(tag, Glyf::TAG | Cff::TAG | Loca::TAG);
 
             let rel_offset = if can_share {
-                if let Some(&off) = table_cache.get(&(tag, data.clone())) {
+                if let Some(&off) = table_cache.get(&(tag, table_data.clone())) {
                     off
                 } else {
                     while table_data_block.len() % 4 != 0 {
@@ -366,8 +356,8 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
                     }
 
                     let off = table_data_block.len() as u32;
-                    table_cache.insert((tag, data.clone()), off);
-                    table_data_block.extend(&data);
+                    table_cache.insert((tag, table_data.clone()), off);
+                    table_data_block.extend(&table_data);
 
                     off
                 }
@@ -377,7 +367,7 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
                 }
 
                 let off = table_data_block.len() as u32;
-                table_data_block.extend(&data);
+                table_data_block.extend(&table_data);
 
                 off
             };
@@ -385,7 +375,7 @@ pub fn build_ttc(fonts: &[FontRef], family_name: &str) -> Result<Vec<u8>> {
             out.extend_from_slice(&tag.to_be_bytes());
             out.extend_from_slice(&record.checksum().to_be_bytes());
             out.extend_from_slice(&rel_offset.to_be_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(&(table_data.len() as u32).to_be_bytes());
         }
     }
 

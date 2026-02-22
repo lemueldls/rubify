@@ -22,7 +22,7 @@ struct Cli {
     #[facet(args::named, args::short = 'o')]
     out: PathBuf,
 
-    /// Optional font file to use for ruby characters
+    /// Separate font file to use for ruby characters
     #[facet(args::named)]
     font: Option<PathBuf>,
 
@@ -245,12 +245,7 @@ fn process_font(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         }
     };
 
-    let mut new_font_data = rubify::process_font_file(base_file, &renderer)?;
-
-    if cli.subset {
-        info!("Subsetting font...");
-        new_font_data = rubify::subset_by_renderers(&new_font_data, &renderer)?;
-    }
+    let mut new_font_data = rubify::process_font_file(base_file, &renderer, cli.subset)?;
 
     // let extension = out_path
     //     .extension()
