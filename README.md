@@ -20,7 +20,7 @@ rubify <input-file-or-glob> -o <out-dir> --ruby <pinyin|romaji> [options]
 - `--out, -o <path>`: Output directory (required)
 - `--ruby <pinyin|romaji>`: Which annotation renderer to use (requires building with the corresponding feature)
 - `--font <path>`: Separate font file to use for ruby characters
-- `--subset`: Subset output font to contain only annotation characters
+- `--subset`: Subset output font to contain only annotated characters
 - `--split`: When input is a TTC, write each font as a separate TTF file instead of rebuilding a TTC
 - `--woff2`: Convert outputs to WOFF2
 - `--position <top|bottom|leftdown|leftup|rightdown|rightup>`: Where to place ruby annotations relative to the base glyph. Valid values:

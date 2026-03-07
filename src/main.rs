@@ -30,7 +30,7 @@ struct Cli {
     #[facet(args::named)]
     font: Option<PathBuf>,
 
-    /// Subset the font to include only annotation characters.
+    /// Subset the font to include only annotated characters.
     #[facet(args::named, default = false)]
     subset: bool,
 
