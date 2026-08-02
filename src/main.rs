@@ -6,6 +6,7 @@ use figue::{self as args, FigueBuiltins};
 use fontcull_read_fonts::FileRef;
 use glob::glob;
 use indicatif::ProgressStyle;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rubify::renderer::{self, RubyPosition, RubyRenderer};
 use rustc_hash::FxHashSet;
 use tracing::{info, info_span};
@@ -170,7 +171,7 @@ fn main() -> Result<()> {
 
     for in_path in &input_paths {
         inputs_span.pb_inc(1);
-        inputs_span.pb_set_message(&format!("Processing {}", in_path.display()));
+        inputs_span.pb_set_message(&format!("Processing {in_path:?}"));
 
         let file_name = in_path
             .file_name()
@@ -195,9 +196,9 @@ fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
     let base_font_data =
         fs::read(in_path).with_context(|| anyhow!("Failed to read input file: {in_path:?}"))?;
     let base_file = FileRef::new(&base_font_data)
-        .map_err(|e| anyhow!("Failed to parse base font file: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to parse base font file: {e:?}"))?;
 
-    info!("Processing {:?} -> {:?}", in_path, out_path);
+    info!("Processing {in_path:?} -> {out_path:?}");
 
     let ruby_font_data = if let Some(path) = &cli.font {
         fs::read(path).with_context(|| anyhow!("Failed to read ruby font file: {path:?}"))?
@@ -249,25 +250,47 @@ fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
 
     let fonts = rubify::process_font_file(base_file, &*renderer, cli.subset, cli.split)?;
 
-    for font in fonts {
-        let mut data = font.data;
-        let base_path = match font.file_name {
-            Some(name) => cli.out.join(name),
-            None => out_path.clone(),
-        };
-        let mut path = base_path;
+    let outputs_span = info_span!("write_fonts_to_outputs");
+    outputs_span.pb_set_style(
+        &ProgressStyle::with_template("{msg} [{wide_bar:.green/cyan}] {pos}/{len}").unwrap(),
+    );
 
-        #[cfg(feature = "woff2")]
-        if cli.woff2 {
-            info!("Converting to WOFF2");
-            data = rubify::convert_to_woff2(&data)?;
-            path = path.with_extension("woff2");
-        }
+    outputs_span.pb_set_length(fonts.len() as u64);
+    outputs_span.pb_set_message("Processing font outputs");
 
-        fs::write(&path, data).with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
+    let outputs_span_enter = outputs_span.enter();
 
-        info!("Wrote {path:?}");
-    }
+    fonts
+        .into_par_iter()
+        .map(|font| {
+            let mut data = font.data;
+            let base_path = match font.file_name {
+                Some(name) => cli.out.join(name),
+                None => out_path.clone(),
+            };
+            let mut path = base_path;
+
+            outputs_span.pb_inc(1);
+            outputs_span.pb_set_message(&format!("Writing {path:?}"));
+
+            #[cfg(feature = "woff2")]
+            if cli.woff2 {
+                info!("Compressing {path:?}");
+                data = rubify::convert_to_woff2(&data)?;
+                path = path.with_extension("woff2");
+            }
+
+            fs::write(&path, data)
+                .with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
+
+            info!("Wrote {path:?}");
+
+            Ok(())
+        })
+        .collect::<Result<()>>()?;
+
+    drop(outputs_span_enter);
+    drop(outputs_span);
 
     Ok(())
 }
