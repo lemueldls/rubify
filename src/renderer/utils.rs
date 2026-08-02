@@ -1,39 +1,71 @@
-use std::sync::atomic::Ordering;
+use std::sync::{Mutex, atomic::Ordering};
 
 use atomic_float::AtomicF64;
 use fontcull_read_fonts::FontRef;
-use fontcull_skrifa::{GlyphId, MetadataProvider, instance::Size};
+use fontcull_skrifa::{
+    GlyphId, MetadataProvider, OutlineGlyphCollection, charmap::Charmap, instance::Size,
+};
 use kurbo::{BezPath, Shape};
+use rustc_hash::FxHashMap;
 
 use crate::renderer::RubyPosition;
 
 pub type GlyphPaths = Vec<(GlyphId, BezPath)>;
 
+/// Cache of drawn ruby-font glyph paths, keyed by character.
+///
+/// The same characters (pinyin letters, romaji letters, kana) are drawn over
+/// and over for every annotated base glyph; caching avoids re-parsing and
+/// re-drawing them for each occurrence.
+#[derive(Default)]
+pub struct GlyphPathCache {
+    by_char: Mutex<FxHashMap<char, Option<(GlyphId, BezPath)>>>,
+}
+
+fn draw_char(
+    cmap: &Charmap,
+    outlines: &OutlineGlyphCollection,
+    pc: char,
+) -> Option<(GlyphId, BezPath)> {
+    let pgid = cmap.map(pc)?;
+
+    if pgid.to_u32() == 0 {
+        return None;
+    }
+
+    let pglyph = outlines.get(pgid)?;
+    let mut ppen = crate::PathPen::new();
+
+    pglyph.draw(Size::unscaled(), &mut ppen).ok()?;
+
+    Some((pgid, ppen.path))
+}
+
 /// Collect glyph paths; returns None if any glyph cannot be found or drawn.
-pub fn collect_glyph_paths(font: &FontRef, text: String) -> Option<GlyphPaths> {
+pub fn collect_glyph_paths(
+    font: &FontRef,
+    text: String,
+    cache: &GlyphPathCache,
+) -> Option<GlyphPaths> {
     let cmap = font.charmap();
     let outlines = font.outline_glyphs();
 
     let mut glyph_paths: Vec<(GlyphId, BezPath)> = Vec::new();
 
     for pc in text.chars() {
-        match cmap.map(pc) {
-            Some(pgid) if pgid.to_u32() != 0 => {
-                if let Some(pglyph) = outlines.get(pgid) {
-                    let mut ppen = crate::PathPen::new();
-                    let res = pglyph.draw(Size::unscaled(), &mut ppen);
+        let entry = {
+            let mut guard = cache.by_char.lock().unwrap();
 
-                    if res.is_ok() {
-                        glyph_paths.push((pgid, ppen.path));
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
+            if let Some(entry) = guard.get(&pc) {
+                entry.clone()
+            } else {
+                let drawn = draw_char(&cmap, &outlines, pc);
+                guard.insert(pc, drawn.clone());
+                drawn
             }
-            _ => return None,
-        }
+        };
+
+        glyph_paths.push(entry?);
     }
 
     Some(glyph_paths)

@@ -25,6 +25,8 @@ pub struct RomajiRenderer<'a> {
     cached_top_target: AtomicF64,
     /// Cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
     cached_bottom_target: AtomicF64,
+    /// Cache of drawn ruby glyph paths, keyed by character
+    path_cache: utils::GlyphPathCache,
 }
 
 impl<'a> RomajiRenderer<'a> {
@@ -48,6 +50,7 @@ impl<'a> RomajiRenderer<'a> {
             tight,
             cached_top_target: AtomicF64::new(f64::NEG_INFINITY),
             cached_bottom_target: AtomicF64::new(f64::INFINITY),
+            path_cache: utils::GlyphPathCache::default(),
         })
     }
 }
@@ -69,10 +72,11 @@ impl<'a> RubyRenderer for RomajiRenderer<'a> {
 
         let hmtx = self.font.hmtx().context("Missing romaji font hmtx")?;
 
-        let glyph_paths = match utils::collect_glyph_paths(&self.font, romaji_text) {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        let glyph_paths =
+            match utils::collect_glyph_paths(&self.font, romaji_text, &self.path_cache) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
 
         let p_scale_factor = (self.scale_ratio * main_upem) / self.upem;
 

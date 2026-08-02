@@ -1,7 +1,26 @@
+use std::hash::Hasher;
+
 use anyhow::{Context, Result};
 use fontcull_read_fonts::{FontRef, TopLevelTable, tables::cff::Cff, types::Tag};
 use fontcull_write_fonts::tables::{glyf::Glyf, loca::Loca};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+fn append_table(block: &mut Vec<u8>, data: &[u8]) -> u32 {
+    while !block.len().is_multiple_of(4) {
+        block.push(0);
+    }
+
+    let off = block.len() as u32;
+    block.extend_from_slice(data);
+
+    off
+}
 
 pub fn build_collection(fonts: &[FontRef]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -19,7 +38,7 @@ pub fn build_collection(fonts: &[FontRef]) -> Result<Vec<u8>> {
     }
 
     let mut font_offsets = Vec::new();
-    let mut table_cache: FxHashMap<(Tag, Vec<u8>), u32> = FxHashMap::default();
+    let mut table_cache: FxHashMap<(Tag, u64), (u32, Vec<u8>)> = FxHashMap::default();
     let mut table_data_block = Vec::new();
 
     // Process and rewrite each font
@@ -44,39 +63,35 @@ pub fn build_collection(fonts: &[FontRef]) -> Result<Vec<u8>> {
                 .context("Table missing")?
                 .as_ref()
                 .to_vec();
+            let table_len = table_data.len() as u32;
 
             // Only share tables that are usually safe and heavy
             let can_share = matches!(tag, Glyf::TAG | Cff::TAG | Loca::TAG);
 
             let rel_offset = if can_share {
-                if let Some(&off) = table_cache.get(&(tag, table_data.clone())) {
-                    off
-                } else {
-                    while table_data_block.len() % 4 != 0 {
-                        table_data_block.push(0);
-                    }
+                let hash = hash_bytes(&table_data);
 
-                    let off = table_data_block.len() as u32;
-                    table_cache.insert((tag, table_data.clone()), off);
-                    table_data_block.extend(&table_data);
+                if let Some((off, existing)) = table_cache.get(&(tag, hash)) {
+                    if existing == &table_data {
+                        // Identical to a previously written table: reuse it
+                        *off
+                    } else {
+                        append_table(&mut table_data_block, &table_data)
+                    }
+                } else {
+                    let off = append_table(&mut table_data_block, &table_data);
+                    table_cache.insert((tag, hash), (off, table_data));
 
                     off
                 }
             } else {
-                while table_data_block.len() % 4 != 0 {
-                    table_data_block.push(0);
-                }
-
-                let off = table_data_block.len() as u32;
-                table_data_block.extend(&table_data);
-
-                off
+                append_table(&mut table_data_block, &table_data)
             };
 
             out.extend_from_slice(&tag.to_be_bytes());
             out.extend_from_slice(&record.checksum().to_be_bytes());
             out.extend_from_slice(&rel_offset.to_be_bytes());
-            out.extend_from_slice(&(table_data.len() as u32).to_be_bytes());
+            out.extend_from_slice(&table_len.to_be_bytes());
         }
     }
 

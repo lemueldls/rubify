@@ -203,8 +203,9 @@ fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         base_font_data.clone()
     };
 
-    let ruby_font_data = Box::leak(ruby_font_data.into_boxed_slice());
-    let ruby_file = FileRef::new(ruby_font_data).context("Failed to parse ruby font file")?;
+    let ruby_font_data = Box::<[u8]>::from(ruby_font_data);
+    let ruby_file =
+        FileRef::new(ruby_font_data.as_ref()).context("Failed to parse ruby font file")?;
     let ruby_fonts: Vec<_> = ruby_file.fonts().collect();
 
     if ruby_fonts.is_empty() {
@@ -215,7 +216,7 @@ fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         .clone()
         .context("Failed to load font from ruby font file")?;
 
-    let renderer: Box<dyn RubyRenderer> = match ruby {
+    let renderer: Box<dyn RubyRenderer + '_> = match ruby {
         #[cfg(feature = "pinyin")]
         Ruby::Pinyin => {
             let renderer = renderer::pinyin::PinyinRenderer::new(
@@ -244,17 +245,21 @@ fn process_file(cli: &Cli, ruby: &Ruby, in_path: &PathBuf, out_path: &PathBuf) -
         }
     };
 
-    let fonts = rubify::process_font_file(base_file, &renderer, cli.subset, cli.split)?;
+    let fonts = rubify::process_font_file(base_file, &*renderer, cli.subset, cli.split)?;
 
     for font in fonts {
         let mut data = font.data;
-        let mut path = out_path.to_owned();
+        let base_path = match font.file_name {
+            Some(name) => cli.out.join(name),
+            None => out_path.clone(),
+        };
+        let mut path = base_path;
 
         #[cfg(feature = "woff2")]
         if cli.woff2 {
             info!("Converting to WOFF2");
             data = rubify::convert_to_woff2(&data)?;
-            path = out_path.with_extension("woff2");
+            path = path.with_extension("woff2");
         }
 
         fs::write(&path, data).with_context(|| anyhow!("Failed to write output file: {path:?}"))?;
