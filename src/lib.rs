@@ -355,5 +355,5 @@ pub fn subset_by_renderers(font_data: &[u8], renderer: &dyn RubyRenderer) -> Res
 
 #[cfg(feature = "woff2")]
 pub fn convert_to_woff2(font_data: &[u8]) -> Result<Vec<u8>> {
-    woofwoof::compress(font_data, &[], 11, true).context("WOFF2 compression failed")
+    woofwoof::compress(font_data, [], 11, true).context("WOFF2 compression failed")
 }

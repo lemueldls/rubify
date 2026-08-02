@@ -13,6 +13,12 @@ impl PathPen {
     }
 }
 
+impl Default for PathPen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutlinePen for PathPen {
     fn move_to(&mut self, x: f32, y: f32) {
         self.path.move_to((x as f64, y as f64));

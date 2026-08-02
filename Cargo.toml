@@ -15,8 +15,8 @@ woff2 = ["dep:woofwoof"]
 [dependencies]
 anyhow = "1.0"
 atomic_float = "1.1.0"
-facet = { version = "0.44" }
-figue = {  version = "2.0.0" }
+facet = { version = "0.46.5" }
+figue = { version = "4.0.5" }
 fontcull = { version = "2.0", default-features = false }
 fontcull-font-types = "0.10"
 fontcull-klippa = "0.1"
@@ -32,5 +32,5 @@ rustc-hash = "2.1.1"
 tracing = "0.1"
 tracing-indicatif = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-wana_kana = { version = "4.0.0", optional = true }
+wana_kana = { version = "5.0.0", optional = true }
 woofwoof = { version = "1.0", optional = true }

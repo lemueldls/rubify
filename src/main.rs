@@ -14,7 +14,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Facet)]
 struct Cli {
-    /// Input paths or glob patterns (can be repeated), e.g. 'fonts/*.ttf' or 'file.ttf'
+    /// Input paths or glob patterns (can be repeated), e.g. 'fonts/*.ttf' or
+    /// 'file.ttf'
     #[facet(args::positional)]
     inputs: Vec<String>,
 
@@ -34,7 +35,8 @@ struct Cli {
     #[facet(args::named, default = false)]
     subset: bool,
 
-    /// Split font collection (TTC) into separate TTF files instead of rebuilding as TTC.
+    /// Split font collection (TTC) into separate TTF files instead of
+    /// rebuilding as TTC.
     #[facet(args::named, default = false)]
     split: bool,
 
@@ -55,11 +57,13 @@ struct Cli {
     #[facet(args::named, default = 0.0)]
     gutter: f64,
 
-    /// When set, use tight per-character placement. By default we use a consistent baseline.
+    /// When set, use tight per-character placement. By default we use a
+    /// consistent baseline.
     #[facet(args::named, default = false)]
     tight: bool,
 
-    /// Fine-tune baseline offset (in em units). Positive moves annotation further away from base glyph.
+    /// Fine-tune baseline offset (in em units). Positive moves annotation
+    /// further away from base glyph.
     #[facet(args::named, default = 0.0)]
     offset: f64,
 
@@ -84,9 +88,7 @@ impl FromStr for Ruby {
             "pinyin" => Ok(Ruby::Pinyin),
             #[cfg(feature = "romaji")]
             "romaji" => Ok(Ruby::Romaji),
-            other => {
-                return Err(anyhow!("Unknown ruby characters argument: {other}"));
-            }
+            other => Err(anyhow!("Unknown ruby characters argument: {other}")),
         }
     }
 }
@@ -118,7 +120,7 @@ fn main() -> Result<()> {
     let cli: Cli = args::from_std_args().unwrap();
 
     let ruby = Ruby::from_str(&cli.ruby)
-        .with_context(|| anyhow!("Failed to parse --ruby argument: {}", &cli.ruby))?;
+        .with_context(|| anyhow!("Failed to parse --ruby argument: {}", cli.ruby))?;
 
     let mut input_paths: FxHashSet<PathBuf> = FxHashSet::default();
 
@@ -178,7 +180,7 @@ fn main() -> Result<()> {
 
         let out_path = cli.out.join(file_name);
 
-        process_file(&cli, &ruby, &in_path, &out_path)?;
+        process_file(&cli, &ruby, in_path, &out_path)?;
     }
 
     drop(inputs_span_enter);
