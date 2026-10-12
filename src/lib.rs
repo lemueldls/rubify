@@ -332,7 +332,10 @@ pub fn subset_by_renderers(font_data: &[u8], renderer: &dyn RubyRenderer) -> Res
     }
 
     let glyph_ids = IntSet::<GlyphId>::empty();
-    let drop_tables = IntSet::<Tag>::empty();
+    let drop_tables: IntSet<Tag> = ["vhea", "vmtx", "VORG"]
+        .into_iter()
+        .map(|tag| Tag::new_checked(tag.as_bytes()))
+        .collect::<Result<_, _>>()?;
     let no_subset_tables = IntSet::<Tag>::empty();
     let passthrough_tables = IntSet::<Tag>::empty();
     let name_ids = IntSet::<NameId>::empty();
