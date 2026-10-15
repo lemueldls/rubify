@@ -71,7 +71,10 @@ impl RubyRenderer for HiraganaRenderer<'_> {
             return None;
         }
 
-        Some(to_hiragana(reading))
+        // Compose first: a decomposed か + ゙ must draw as one が.
+        let reading = crate::words::normalize_nfc(reading);
+
+        Some(to_hiragana(reading.as_ref()))
     }
 
     fn required_targets(

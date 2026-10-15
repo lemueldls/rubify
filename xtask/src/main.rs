@@ -16,7 +16,8 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use facet::Facet;
 use rubify::{
     dictionary::{Dictionary, DictionaryEntry, DictionaryReading, encode},
     words::tag_bit,
@@ -27,6 +28,29 @@ const FURIFONT_BASE: &str =
     "https://raw.githubusercontent.com/antfu/furifont/v0.3.0/packages/dictionary";
 const CEDICT_URL: &str =
     "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz";
+
+/// furifont's compiled `dictionary.json`.
+#[derive(Facet)]
+struct RawDictionary {
+    sources: BTreeMap<String, String>,
+    entries: Vec<RawEntry>,
+}
+
+/// One `[form, words, nf, priority, order, optional conjugates]` entry.
+#[derive(Facet)]
+struct RawEntry(String, String, u16, String, u16, Option<u8>);
+
+/// One `[form, words, level]` row of `jlpt.json`.
+#[derive(Facet)]
+struct RawJlpt(String, String, u8);
+
+/// One `[form, words, uses]` row of `tatoeba.json`.
+#[derive(Facet)]
+struct RawTatoeba(String, String, u16);
+
+/// One `[form, words]` place name.
+#[derive(Facet)]
+struct RawPlace(String, String);
 
 /// The base font for `example.png` (SIL Open Font License 1.1).
 pub(crate) const EXAMPLE_FONT: &str = "LXGWWenKai-Regular.ttf";
@@ -127,9 +151,12 @@ pub(crate) fn fetch(cache: &Path, name: &str, url: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value> {
+fn read_json<T: Facet<'static>>(path: &Path) -> Result<T> {
     let data = fs::read(path).with_context(|| format!("Failed to read {path:?}"))?;
-    serde_json::from_slice(&data).with_context(|| format!("Failed to parse {path:?}"))
+    let parsed = facet_json::from_slice(&data)
+        .map_err(|error| anyhow!("Failed to parse {path:?}: {error}"))?;
+
+    Ok(parsed)
 }
 
 fn update_dict() -> Result<()> {
@@ -186,46 +213,30 @@ fn compile_ja(cache: &Path) -> Result<Dictionary> {
         &format!("{FURIFONT_BASE}/src/overrides.ts"),
     )?;
 
-    let dictionary = read_json(&dictionary_path)?;
-    let jlpt = read_json(&jlpt_path)?;
-    let tatoeba = read_json(&tatoeba_path)?;
-    let places = read_json(&places_path)?;
+    let dictionary: RawDictionary = read_json(&dictionary_path)?;
+    let jlpt: Vec<RawJlpt> = read_json(&jlpt_path)?;
+    let tatoeba: Vec<RawTatoeba> = read_json(&tatoeba_path)?;
+    let places: Vec<RawPlace> = read_json(&places_path)?;
 
     let mut levels: HashMap<(String, String), u8> = HashMap::new();
 
-    for row in jlpt.as_array().context("jlpt.json is not an array")? {
-        let row = row.as_array().context("jlpt row is not an array")?;
-        let form = row[0].as_str().unwrap_or_default().to_string();
-        let words = row[1].as_str().unwrap_or_default().to_string();
-        let level = row[2].as_u64().unwrap_or_default() as u8;
+    for RawJlpt(form, words, level) in jlpt {
         levels.insert((form, words), level);
     }
 
     let mut uses: HashMap<(String, String), u16> = HashMap::new();
 
-    for row in tatoeba.as_array().context("tatoeba.json is not an array")? {
-        let row = row.as_array().context("tatoeba row is not an array")?;
-        let form = row[0].as_str().unwrap_or_default().to_string();
-        let words = row[1].as_str().unwrap_or_default().to_string();
-        let n = row[2].as_u64().unwrap_or_default() as u16;
-        uses.insert((form, words), n);
+    for RawTatoeba(form, words, uses_count) in tatoeba {
+        uses.insert((form, words), uses_count);
     }
 
     // One reading per (form, furigana); entries that share the pair merge.
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut entries: Vec<DictionaryEntry> = Vec::new();
 
-    for row in dictionary["entries"]
-        .as_array()
-        .context("dictionary entries are not an array")?
-    {
-        let row = row.as_array().context("dictionary entry is not an array")?;
-        let form = row[0].as_str().unwrap_or_default().to_string();
-        let words = row[1].as_str().unwrap_or_default().to_string();
-        let mut nf = row[2].as_u64().unwrap_or_default() as u16;
-        let priority = row[3].as_str().unwrap_or_default();
-        let order = row[4].as_u64().unwrap_or_default() as u16;
-        let conjugates = row.len() > 5;
+    for RawEntry(form, words, mut nf, priority, order, conjugates) in dictionary.entries {
+        let priority = priority.as_str();
+        let conjugates = conjugates.is_some();
 
         let mut tags = 0u16;
 
@@ -293,11 +304,7 @@ fn compile_ja(cache: &Path) -> Result<Dictionary> {
     // Places fill runs no common word claims, so they stay separate entries.
     let mut seen_places: HashMap<String, ()> = HashMap::new();
 
-    for row in places.as_array().context("places.json is not an array")? {
-        let row = row.as_array().context("place row is not an array")?;
-        let form = row[0].as_str().unwrap_or_default().to_string();
-        let words = row[1].as_str().unwrap_or_default().to_string();
-
+    for RawPlace(form, words) in places {
         if seen_places.insert(form.clone(), ()).is_some() {
             continue;
         }
@@ -318,15 +325,7 @@ fn compile_ja(cache: &Path) -> Result<Dictionary> {
     let defaults = extract_string_array(&overrides, "OVERRIDE_READINGS");
     let bare = extract_string_array(&overrides, "BARE_FORMS");
 
-    let mut sources: Vec<(String, String)> = dictionary["sources"]
-        .as_object()
-        .map(|object| {
-            object
-                .iter()
-                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut sources: Vec<(String, String)> = dictionary.sources.into_iter().collect();
 
     sources.push(("furifont".to_string(), FURIFONT_TAG.to_string()));
 

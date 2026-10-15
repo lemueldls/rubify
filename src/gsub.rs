@@ -4,6 +4,8 @@
 //! ligature-substitution lookups; the rules run under `rclt` and `liga`, both
 //! of which shapers enable by default.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use fontcull_read_fonts::{
     FontData, FontRead,
@@ -13,8 +15,8 @@ use fontcull_write_fonts::{
     dump_table,
     tables::{
         gsub::{
-            Gsub, Ligature, LigatureSet, LigatureSubstFormat1, SingleSubst,
-            SubstitutionChainContext, SubstitutionLookup,
+            ExtensionSubstFormat1, ExtensionSubtable, Gsub, Ligature, LigatureSet,
+            LigatureSubstFormat1, SingleSubst, SubstitutionChainContext, SubstitutionLookup,
         },
         layout::{
             ChainedSequenceContext, ChainedSequenceContextFormat1, ChainedSequenceRule,
@@ -76,6 +78,20 @@ fn as_gid16(gid: GlyphId) -> GlyphId16 {
     GlyphId16::new(gid.to_u32() as u16)
 }
 
+/// A lookup whose subtables sit behind 32-bit extension offsets.
+///
+/// Every lookup stays tiny, so the lookup list and every lookup's own
+/// 16-bit subtable offsets fit, and the table writer's fast path can pack the
+/// (large) subtable data separately. This mirrors what font compilers do for
+/// big GSUBs, and what the writer would otherwise promote piecemeal.
+fn extension_lookup(subtables: Vec<ExtensionSubtable>) -> SubstitutionLookup {
+    SubstitutionLookup::Extension(Lookup {
+        lookup_flag: LookupFlag::default(),
+        subtables: subtables.into_iter().map(Into::into).collect(),
+        mark_filtering_set: None,
+    })
+}
+
 /// Build the lookups a plan needs, referencing glyphs appended after
 /// `first_new_gid`.
 pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u16) -> GsubAddition {
@@ -97,17 +113,16 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
             let coverage =
                 CoverageTable::format_1(pairs.iter().map(|(input, _)| as_gid16(*input)).collect());
             let substitutes: Vec<GlyphId16> = pairs.iter().map(|(_, output)| *output).collect();
-            let lookup = Lookup::new(
-                LookupFlag::default(),
-                vec![SingleSubst::format_2(coverage, substitutes)],
-            );
+            let subtable = SingleSubst::format_2(coverage, substitutes);
             let lookup_index = lookups.len() as u16;
 
             for (input, _) in &pairs {
                 single_chunks.insert((slot as u16, input.to_u32() as u16), lookup_index);
             }
 
-            lookups.push(SubstitutionLookup::Single(lookup));
+            lookups.push(extension_lookup(vec![ExtensionSubtable::Single(
+                ExtensionSubstFormat1::new(1, subtable),
+            )]));
         }
     }
 
@@ -116,23 +131,22 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
     // inside one lookup; a shaper tries subtables in order. Slots stay in
     // separate lookups, so a rule always reaches the right reading.
     for (slot, entries) in plan.ligatures.iter().enumerate() {
-        let mut by_first: LigatureGroups = Vec::new();
+        // Entries may arrive in any order; grouping must not depend on it.
+        let mut by_first: BTreeMap<u16, Vec<(Vec<GlyphId>, usize)>> = BTreeMap::new();
 
         for (components, glyph) in entries {
             let first = components[0].to_u32() as u16;
-
-            match by_first.last_mut() {
-                Some((candidate, group)) if *candidate == first => {
-                    group.push((components.clone(), *glyph))
-                }
-                _ => by_first.push((first, vec![(components.clone(), *glyph)])),
-            }
+            by_first
+                .entry(first)
+                .or_default()
+                .push((components.clone(), *glyph));
         }
+
+        let by_first: LigatureGroups = by_first.into_iter().collect();
 
         // Chunks of (first, ligatures); a first glyph repeats across chunks.
         let mut chunks: LigatureGroups = Vec::new();
         let mut chunk_bytes = 0usize;
-        let mut chunk_coverages: Vec<u16> = Vec::new();
         let mut subtables: Vec<LigatureSubstFormat1> = Vec::new();
 
         let flush_chunk = |chunks: &mut LigatureGroups,
@@ -182,7 +196,7 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
             // Split one first glyph's ligatures across chunks when they do not
             // fit a subtable.
             while !group.is_empty() {
-                if chunk_bytes + group.len() * 12 > 24_000 || chunk_coverages.len() >= 512 {
+                if chunk_bytes + group.len() * 12 > 24_000 || chunks.len() >= 512 {
                     flush_chunk(&mut chunks, &mut subtables);
                     chunk_bytes = 0;
                 }
@@ -190,11 +204,10 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
                 let take = group
                     .len()
                     .min((24_000usize.saturating_sub(chunk_bytes) / 12).max(1))
-                    .min(512usize.saturating_sub(chunk_coverages.len()).max(1));
+                    .min(512usize.saturating_sub(chunks.len()).max(1));
 
                 let rest = group.split_off(take);
                 chunk_bytes += group.len() * 12;
-                chunk_coverages.push(first);
                 chunks.push((first, group));
 
                 // A first glyph may repeat only across chunks, never within one.
@@ -223,10 +236,14 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
                 ligature_chunks.insert((slot as u16, first), lookup_index);
             }
 
-            lookups.push(SubstitutionLookup::Ligature(Lookup::new(
-                LookupFlag::default(),
-                subtables,
-            )));
+            lookups.push(extension_lookup(
+                subtables
+                    .into_iter()
+                    .map(|subtable| {
+                        ExtensionSubtable::Ligature(ExtensionSubstFormat1::new(4, subtable))
+                    })
+                    .collect(),
+            ));
         }
     }
 
@@ -299,9 +316,15 @@ pub fn build_addition(plan: &FontPlan, first_new_gid: u16, base_lookup_count: u1
     let mut chain_indices = Vec::new();
 
     if !subtables.is_empty() {
-        let lookup = Lookup::new(LookupFlag::default(), subtables);
         chain_indices.push(lookups.len() as u16);
-        lookups.push(SubstitutionLookup::ChainContextual(lookup));
+        lookups.push(extension_lookup(
+            subtables
+                .into_iter()
+                .map(|subtable| {
+                    ExtensionSubtable::ChainContextual(ExtensionSubstFormat1::new(6, subtable))
+                })
+                .collect(),
+        ));
     }
 
     GsubAddition {

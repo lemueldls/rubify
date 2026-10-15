@@ -21,8 +21,8 @@ dict-zh = []
 
 [dependencies]
 anyhow = "1.0"
-bincode = "1"
 facet = { version = "0.46.5" }
+facet-postcard = "0.46"
 figue = { version = "4.0.5" }
 flate2 = "1"
 fontcull-font-types = "0.10"
@@ -36,12 +36,16 @@ kurbo = "0.12"
 pinyin = { version = "0.11.0", optional = true }
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
-serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-indicatif = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1"
 woofwoof = { version = "1.0", optional = true }
 
 [dev-dependencies]
 rustybuzz = "0.20"
 ttf-parser = "0.25"
+
+[[bench]]
+name = "gsub"
+harness = false

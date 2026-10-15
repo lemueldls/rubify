@@ -4,12 +4,28 @@
 //! spans of it (`日[に]本[ほん]`), which lets a font annotate readings that no
 //! single character can express (今日 きょう, 中国 zhōng guó).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 use rustc_hash::FxHashSet;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::dictionary::{Dictionary, DictionaryReading};
+
+/// Normalize annotation text to NFC.
+///
+/// Readings may arrive decomposed (base letter plus a combining tone mark, as
+/// some inputs and pasted text produce); fonts usually only carry the composed
+/// glyphs, and a combining mark drawn as its own character lands in the wrong
+/// place. Composing first makes both spellings draw identically.
+pub fn normalize_nfc(text: &str) -> Cow<'_, str> {
+    if unicode_normalization::is_nfc(text) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.nfc().collect())
+    }
+}
 
 /// Priority tags the dictionary compiler records as a bitmask.
 pub const TAG_NAMES: &[&str] = &[
@@ -595,6 +611,17 @@ mod tests {
     fn word_list_lines() {
         let entries = parse_word_list("# comment\n今日[きょう]\n中国\tzhōng guó\n\n").unwrap();
         assert_eq!(entries, vec!["今日[きょう]", "中国[zhōng guó]"]);
+    }
+
+    #[test]
+    fn annotations_are_composed() {
+        // NFD (base letter + combining mark) composes to the glyph text.
+        let decomposed = "ha\u{030C}o";
+        assert_eq!(normalize_nfc(decomposed).as_ref(), "hǎo");
+        assert_eq!(normalize_nfc("hǎo").as_ref(), "hǎo");
+
+        // Decomposed kana compose too (か + combining dakuten → が).
+        assert_eq!(normalize_nfc("か\u{3099}").as_ref(), "が");
     }
 
     fn reading(words: &str, nf: u16, tags: u16, order: u16, jlpt: u8) -> DictionaryReading {

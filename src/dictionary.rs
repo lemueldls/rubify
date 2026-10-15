@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use facet::Facet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
@@ -25,62 +25,47 @@ impl Lang {
 }
 
 /// A compiled dictionary.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Facet)]
 pub struct Dictionary {
     /// Source datasets and the version each was compiled from.
-    #[serde(default)]
     pub sources: Vec<(String, String)>,
-    #[serde(default)]
     pub entries: Vec<DictionaryEntry>,
     /// Curated default readings in inline notation.
-    #[serde(default)]
     pub defaults: Vec<String>,
     /// Forms never to annotate.
-    #[serde(default)]
     pub bare: Vec<String>,
 }
 
 /// One written form and its readings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Facet)]
 pub struct DictionaryEntry {
     pub form: String,
-    #[serde(default)]
     pub readings: Vec<DictionaryReading>,
     /// A place name: it only fills runs no common word claims.
-    #[serde(default)]
     pub place: bool,
 }
 
 /// One reading of a form, with the metadata that ranks and selects it.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Facet)]
 pub struct DictionaryReading {
     /// Alignment: `0:に;1:ほん`, or `0-1:きょう` for a reading spanning characters.
-    #[serde(default)]
     pub words: String,
     /// Newspaper frequency bucket (0 when unranked).
-    #[serde(default)]
     pub nf: u16,
     /// JLPT level listing this reading (0 when none).
-    #[serde(default)]
     pub jlpt: u8,
     /// Priority tags, as a bitmask over [`crate::words::TAG_NAMES`].
-    #[serde(default)]
     pub tags: u16,
     /// Position of the reading among the form's readings, in JMdict order.
-    #[serde(default)]
     pub order: u16,
     /// Uses in Tatoeba's example sentences.
-    #[serde(default)]
     pub tatoeba: u16,
     /// Selected by the dictionary itself, whatever its ranking (CC-CEDICT
     /// entries carry no frequency metadata).
-    #[serde(default)]
     pub common: bool,
     /// `来る`-type verb, whose kanji reads differently as it conjugates.
-    #[serde(default)]
     pub conjugates: bool,
     /// Made the default by the curated list (1) or the user (2).
-    #[serde(default)]
     pub pinned: u8,
 }
 
@@ -89,7 +74,8 @@ const ZLIB_LEVEL: u32 = 9;
 pub fn encode(dictionary: &Dictionary) -> Result<Vec<u8>> {
     use std::io::Write;
 
-    let raw = bincode::serialize(dictionary).context("Failed to serialize dictionary")?;
+    let raw = facet_postcard::to_vec(dictionary)
+        .map_err(|error| anyhow::anyhow!("Failed to serialize dictionary: {error:?}"))?;
     let mut encoder =
         flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(ZLIB_LEVEL));
     encoder
@@ -100,8 +86,16 @@ pub fn encode(dictionary: &Dictionary) -> Result<Vec<u8>> {
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Dictionary> {
+    use std::io::Read;
+
     let mut decoder = flate2::read::ZlibDecoder::new(bytes);
-    bincode::deserialize_from(&mut decoder).context("Failed to decode dictionary")
+    let mut raw = Vec::new();
+    decoder
+        .read_to_end(&mut raw)
+        .context("Failed to decompress dictionary")?;
+
+    facet_postcard::from_slice(&raw)
+        .map_err(|error| anyhow::anyhow!("Failed to decode dictionary: {error:?}"))
 }
 
 pub fn load_path(path: &Path) -> Result<Dictionary> {

@@ -7,6 +7,7 @@
 //! remarkably few outlines.
 
 use fontcull_read_fonts::types::GlyphId;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 
 use crate::words::{RubySpan, SelectedWord};
@@ -160,6 +161,17 @@ impl Builder {
     }
 }
 
+/// A word whose inputs and rendered texts are ready, before it touches the
+/// shared glyph registry.
+struct PreparedWord {
+    bases: Vec<char>,
+    input: Vec<GlyphId>,
+    spans: Vec<RubySpan>,
+    followings: Vec<String>,
+    rendered: Vec<String>,
+    grouped: bool,
+}
+
 /// Plan the words a font can draw.
 ///
 /// `char_to_gid` maps every base character of the font, and `render` returns
@@ -168,7 +180,7 @@ impl Builder {
 pub fn build_plan(
     words: &[SelectedWord],
     char_to_gid: &FxHashMap<char, GlyphId>,
-    render: &dyn Fn(&str, &str) -> Option<String>,
+    render: impl Fn(&str, &str) -> Option<String> + Sync,
 ) -> FontPlan {
     // Later entries win: this lets custom words override dictionary ones.
     let mut by_sequence: FxHashMap<Vec<char>, &SelectedWord> = FxHashMap::default();
@@ -180,83 +192,89 @@ pub fn build_plan(
     let mut sequences: Vec<Vec<char>> = by_sequence.keys().cloned().collect();
     sequences.sort();
 
-    let mut builder = Builder::default();
-    let mut skipped = 0usize;
+    // Everything that does not need the registry is independent per word and
+    // runs in parallel; measuring the ruby glyphs is the expensive part.
+    let prepared: Vec<Option<PreparedWord>> = sequences
+        .par_iter()
+        .map(|sequence| {
+            let word = by_sequence[sequence];
 
-    for sequence in sequences {
-        let word = by_sequence[&sequence];
+            let input: Option<Vec<GlyphId>> = sequence
+                .iter()
+                .map(|c| char_to_gid.get(c).copied())
+                .collect();
 
-        let input: Option<Vec<GlyphId>> = sequence
-            .iter()
-            .map(|c| char_to_gid.get(c).copied())
-            .collect();
+            let input = input?;
 
-        let Some(input) = input else {
-            skipped += 1;
-            continue;
-        };
-
-        if word.spans.is_empty() {
-            skipped += 1;
-            continue;
-        }
-
-        // Every character must be covered and every span must be inside the
-        // word: otherwise the ligature would drop an annotation.
-        let mut covered = vec![false; sequence.len()];
-
-        for span in &word.spans {
-            if span.start >= span.end || span.end > sequence.len() || span.ruby.is_empty() {
-                covered.clear();
-                break;
+            if word.spans.is_empty() {
+                return None;
             }
 
-            covered[span.start..span.end].fill(true);
-        }
+            // Every character must be covered and every span must be inside
+            // the word: otherwise the ligature would drop an annotation.
+            let mut covered = vec![false; sequence.len()];
 
-        if covered.iter().any(|c| !*c) {
-            skipped += 1;
-            continue;
-        }
+            for span in &word.spans {
+                if span.start >= span.end || span.end > sequence.len() || span.ruby.is_empty() {
+                    return None;
+                }
 
-        let following = |index: usize| -> String {
-            word.spans[index + 1..]
-                .iter()
-                .map(|span| span.ruby.as_str())
-                .collect()
-        };
+                covered[span.start..span.end].fill(true);
+            }
 
-        // The rendered text decides what the glyph draws; a word with any
-        // reading the ruby font cannot draw is skipped whole.
-        let rendered: Option<Vec<String>> = word
-            .spans
-            .iter()
-            .enumerate()
-            .map(|(index, span)| render(&span.ruby, &following(index)))
-            .collect();
+            if covered.iter().any(|c| !*c) {
+                return None;
+            }
 
-        let Some(rendered) = rendered else {
-            skipped += 1;
-            continue;
-        };
-
-        let grouped = word.spans.iter().any(|span| span.end > span.start + 1);
-
-        if grouped {
             let followings: Vec<String> = word
                 .spans
                 .iter()
                 .enumerate()
-                .map(|(index, _)| following(index))
+                .map(|(index, _)| {
+                    word.spans[index + 1..]
+                        .iter()
+                        .map(|span| span.ruby.as_str())
+                        .collect()
+                })
                 .collect();
 
-            let glyph = builder.register_glyph(
-                sequence.clone(),
-                input.clone(),
-                word.spans.clone(),
+            // The rendered text decides what the glyph draws; a word with any
+            // reading the ruby font cannot draw is skipped whole.
+            let rendered: Option<Vec<String>> = word
+                .spans
+                .iter()
+                .enumerate()
+                .map(|(index, span)| render(&span.ruby, &followings[index]))
+                .collect();
+
+            let rendered = rendered?;
+
+            Some(PreparedWord {
+                bases: sequence.clone(),
+                input,
+                spans: word.spans.clone(),
                 followings,
-                &rendered,
-            );
+                rendered,
+                grouped: word.spans.iter().any(|span| span.end > span.start + 1),
+            })
+        })
+        .collect();
+
+    let skipped = prepared.iter().filter(|word| word.is_none()).count();
+    let mut builder = Builder::default();
+
+    for prepared in prepared.into_iter().flatten() {
+        let PreparedWord {
+            bases,
+            input,
+            spans,
+            followings,
+            rendered,
+            grouped,
+        } = prepared;
+
+        if grouped {
+            let glyph = builder.register_glyph(bases, input.clone(), spans, followings, &rendered);
             let lookup = builder.ligature_lookup(&input, glyph);
             let mut lookups = vec![Some(lookup); input.len()];
 
@@ -270,9 +288,8 @@ pub fn build_plan(
         } else {
             let mut lookups = Vec::with_capacity(input.len());
 
-            for (index, (ch, gid)) in sequence.iter().zip(&input).enumerate() {
-                let span = word
-                    .spans
+            for (index, (ch, gid)) in bases.iter().zip(&input).enumerate() {
+                let span = spans
                     .iter()
                     .find(|span| span.start == index)
                     .expect("single spans cover every character");
@@ -285,7 +302,7 @@ pub fn build_plan(
                         end: 1,
                         ruby: span.ruby.clone(),
                     }],
-                    vec![following(index)],
+                    vec![followings[index].clone()],
                     &rendered[index..index + 1],
                 );
 
@@ -345,7 +362,7 @@ mod tests {
         ];
         let gids = map(&[('中', 10), ('国', 11), ('学', 12)]);
 
-        let plan = build_plan(&words, &gids, &render);
+        let plan = build_plan(&words, &gids, render);
 
         // 中(ちゅう) is shared between the two words.
         assert_eq!(plan.glyphs.len(), 3);
@@ -359,7 +376,7 @@ mod tests {
         let words = vec![word("日本", "0-1:にほん")];
         let gids = map(&[('日', 1), ('本', 2)]);
 
-        let plan = build_plan(&words, &gids, &render);
+        let plan = build_plan(&words, &gids, render);
 
         assert_eq!(plan.glyphs.len(), 1, "one ligature glyph");
         assert_eq!(plan.ligatures.len(), 1);
@@ -382,7 +399,7 @@ mod tests {
         ];
         let gids = map(&[('日', 1), ('本', 2), ('語', 3)]);
 
-        let plan = build_plan(&words, &gids, &render);
+        let plan = build_plan(&words, &gids, render);
 
         assert_eq!(plan.rules.len(), 2);
         assert_eq!(plan.rules[0].input.len(), 3, "日本語 comes first");
@@ -394,7 +411,7 @@ mod tests {
         let words = vec![word("日本", "0-1:にほん")];
         let gids = map(&[('日', 1)]); // 本 is missing
 
-        let plan = build_plan(&words, &gids, &render);
+        let plan = build_plan(&words, &gids, render);
 
         assert!(plan.glyphs.is_empty());
         assert!(plan.rules.is_empty());
@@ -406,7 +423,7 @@ mod tests {
         let words = vec![word("学校", "0:がっ;1:こう")];
         let gids = map(&[('学', 1), ('校', 2)]);
 
-        let plan = build_plan(&words, &gids, &render);
+        let plan = build_plan(&words, &gids, render);
 
         assert_eq!(plan.glyphs.len(), 2);
         assert_eq!(plan.glyphs[0].followings, vec!["こう".to_string()]);

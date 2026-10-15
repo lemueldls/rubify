@@ -6,6 +6,8 @@ pub mod renderer;
 pub mod ttc;
 pub mod words;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use fontcull_font_types::NameId;
 use fontcull_klippa::{Plan, SubsetFlags, subset_font};
@@ -327,14 +329,16 @@ pub fn process_font_ref_with(
         .collect::<Result<Vec<_>>>()?;
 
     // Plan the word glyphs and draw their base outlines.
+    let plan_timer = std::time::Instant::now();
     let plan = words.map(|words| {
-        plan::build_plan(words, &char_to_gid, &|reading, following| {
+        plan::build_plan(words, &char_to_gid, |reading: &str, following: &str| {
             let text = renderer.prepare_text(reading, following)?;
 
             renderer.can_draw_text(&text).then_some(text)
         })
     });
 
+    tracing::debug!("Planned word rules in {:?}", plan_timer.elapsed());
     let word_stage: Vec<WordGlyphStage> = match &plan {
         Some(plan) if !plan.glyphs.is_empty() => plan
             .glyphs
@@ -535,7 +539,13 @@ pub fn process_font_ref_with(
         .data_for_tag(Gsub::TAG)
         .map(|data| data.as_bytes().to_vec());
 
-    let gsub_bytes: Option<Vec<u8>> = match &plan {
+    let gsub_timer = std::time::Instant::now();
+
+    // Build the lookups, then drop the whole plan before packing: the packer
+    // builds its own (large) graph, and holding both roughly doubles peak RSS.
+    let rule_count = plan.as_ref().map(|plan| plan.rules.len()).unwrap_or(0);
+
+    let addition = match &plan {
         Some(plan) if !plan.glyphs.is_empty() => {
             let base_lookup_count = existing_gsub
                 .as_deref()
@@ -543,20 +553,59 @@ pub fn process_font_ref_with(
                 .map(|gsub| gsub.lookup_list.lookups.len() as u16)
                 .unwrap_or(0);
 
+            let add_timer = std::time::Instant::now();
             let addition = gsub::build_addition(plan, first_new_gid, base_lookup_count);
+            tracing::debug!("Built GSUB lookups in {:?}", add_timer.elapsed());
 
-            if addition.is_empty() {
-                None
-            } else {
-                Some(
-                    gsub::merge(existing_gsub.as_deref(), addition)
-                        .context("Failed to merge GSUB rules")?,
-                )
-            }
+            addition
         }
-        _ => None,
+        _ => gsub::GsubAddition::default(),
     };
 
+    drop(plan);
+
+    let gsub_bytes: Option<Vec<u8>> = if addition.is_empty() {
+        None
+    } else {
+        // Packing takes seconds for large dictionaries and is otherwise
+        // silent; keep a spinner running while the table writer works.
+        let pack_span = info_span!("packing_gsub");
+        pack_span.pb_set_style(&ProgressStyle::with_template(
+            "{spinner:.green} {msg} [{elapsed_precise}]",
+        )?);
+        pack_span.pb_set_message(&format!("Packing GSUB rules ({rule_count} rules)"));
+        let pack_span_enter = pack_span.enter();
+
+        let merged = std::thread::scope(|scope| {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ticker_stop = Arc::clone(&stop);
+            let ticker_span = pack_span.clone();
+
+            let ticker = scope.spawn(move || {
+                while !ticker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    ticker_span.pb_tick();
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+            });
+
+            let merge_timer = std::time::Instant::now();
+            let merged = gsub::merge(existing_gsub.as_deref(), addition);
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = ticker.join();
+            tracing::debug!("Packed GSUB in {:?}", merge_timer.elapsed());
+
+            merged
+        })
+        .context("Failed to merge GSUB rules")?;
+
+        drop(pack_span_enter);
+        drop(pack_span);
+
+        Some(merged)
+    };
+
+    tracing::debug!("Total GSUB work in {:?}", gsub_timer.elapsed());
     let mut font_builder = FontBuilder::new();
     let rebuild_tables = !word_metrics.is_empty();
     let mut wrote_gsub = false;

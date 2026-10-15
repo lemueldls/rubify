@@ -295,9 +295,11 @@ impl RubyRenderer for RomajiRenderer<'_> {
             return None;
         }
 
-        let romaji = to_hepburn(reading, following);
+        let reading = crate::words::normalize_nfc(reading);
+        let following = crate::words::normalize_nfc(following);
+        let romaji = to_hepburn(reading.as_ref(), following.as_ref());
 
-        if romaji.is_empty() || romaji == reading {
+        if romaji.is_empty() || romaji == reading.as_ref() {
             None
         } else {
             Some(romaji)

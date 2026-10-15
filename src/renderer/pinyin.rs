@@ -49,7 +49,7 @@ impl RubyRenderer for PinyinRenderer<'_> {
         if reading.is_empty() {
             None
         } else {
-            Some(reading.to_string())
+            Some(crate::words::normalize_nfc(reading).into_owned())
         }
     }
 
