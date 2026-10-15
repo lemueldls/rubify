@@ -6,18 +6,25 @@ edition = "2024"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/lemueldls/rubify"
 
+[workspace]
+members = [".", "xtask"]
+
 [features]
-default = ["pinyin", "romaji", "woff2"]
+default = ["pinyin", "romaji", "hiragana", "woff2", "dict-ja", "dict-zh"]
 pinyin = ["dep:pinyin"]
-romaji = ["dep:wana_kana"]
+romaji = []
+hiragana = []
 woff2 = ["dep:woofwoof"]
+# Bundle the compiled Japanese (furifont data) / Chinese (CC-CEDICT) word lists.
+dict-ja = []
+dict-zh = []
 
 [dependencies]
 anyhow = "1.0"
-atomic_float = "1.1.0"
+bincode = "1"
 facet = { version = "0.46.5" }
 figue = { version = "4.0.5" }
-fontcull = { version = "2.0", default-features = false }
+flate2 = "1"
 fontcull-font-types = "0.10"
 fontcull-klippa = "0.1"
 fontcull-read-fonts = { version = "0.38", features = ["experimental_traverse"] }
@@ -29,8 +36,12 @@ kurbo = "0.12"
 pinyin = { version = "0.11.0", optional = true }
 rayon = "1.11.0"
 rustc-hash = "2.1.1"
+serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-indicatif = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-wana_kana = { version = "5.0.0", optional = true }
 woofwoof = { version = "1.0", optional = true }
+
+[dev-dependencies]
+rustybuzz = "0.20"
+ttf-parser = "0.25"

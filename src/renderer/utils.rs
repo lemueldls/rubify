@@ -1,14 +1,16 @@
-use std::sync::{Mutex, atomic::Ordering};
+use std::sync::Mutex;
 
-use atomic_float::AtomicF64;
-use fontcull_read_fonts::FontRef;
+use fontcull_read_fonts::{FontRef, TableProvider};
 use fontcull_skrifa::{
     GlyphId, MetadataProvider, OutlineGlyphCollection, charmap::Charmap, instance::Size,
 };
-use kurbo::{BezPath, Shape};
+use kurbo::{Affine, BezPath, Shape};
 use rustc_hash::FxHashMap;
 
-use crate::renderer::RubyPosition;
+use crate::{
+    PathPen,
+    renderer::{BaselineTargets, RubyPosition},
+};
 
 pub type GlyphPaths = Vec<(GlyphId, BezPath)>;
 
@@ -34,17 +36,17 @@ fn draw_char(
     }
 
     let pglyph = outlines.get(pgid)?;
-    let mut ppen = crate::PathPen::new();
+    let mut ppen = PathPen::new();
 
     pglyph.draw(Size::unscaled(), &mut ppen).ok()?;
 
     Some((pgid, ppen.path))
 }
 
-/// Collect glyph paths; returns None if any glyph cannot be found or drawn.
+/// Collect glyph paths; returns `None` if any glyph cannot be found or drawn.
 pub fn collect_glyph_paths(
     font: &FontRef,
-    text: String,
+    text: &str,
     cache: &GlyphPathCache,
 ) -> Option<GlyphPaths> {
     let cmap = font.charmap();
@@ -71,190 +73,345 @@ pub fn collect_glyph_paths(
     Some(glyph_paths)
 }
 
-/// Compute widths for each text given a closure to get advance (in font units).
-pub fn compute_glyph_widths(
-    glyph_paths: &GlyphPaths,
-    p_scale_factor: f64,
-    mut get_adv: impl FnMut(GlyphId) -> f64,
-) -> Vec<f64> {
-    let mut text_widths: Vec<f64> = Vec::new();
-
-    for (pgid, _) in glyph_paths {
-        let mut text_width = 0.0;
-        let adv = get_adv(*pgid);
-        text_width += adv * p_scale_factor;
-        text_widths.push(text_width);
-    }
-
-    text_widths
+/// Draws ruby text for one span of a base glyph.
+///
+/// Shared by every renderer: the renderer converts its reading notation to
+/// text, and this painter handles placement, scaling and (optional) fitting.
+pub struct RubyPainter<'a> {
+    /// The font the ruby characters are taken from.
+    font: FontRef<'a>,
+    /// Units per em of the ruby font.
+    pub upem: f64,
+    /// Fraction of the main font size to use for the ruby font (0.4 = 40%).
+    pub scale_ratio: f64,
+    /// Gap (em units) between the base glyph and the ruby text.
+    pub gutter_em: f64,
+    /// Baseline offset in em units to fine tune the annotation baseline.
+    pub baseline_offset_em: f64,
+    /// Position of the ruby relative to the base glyph.
+    pub position: RubyPosition,
+    /// When true, condense overflowing ruby horizontally to fit its span.
+    pub fit: bool,
+    /// Lowest scale `fit` condenses to before letting the ruby overhang.
+    pub fit_floor: f64,
+    /// When true, use tight per-glyph placement instead of a shared baseline.
+    pub tight: bool,
+    /// Cache of drawn ruby glyph paths, keyed by character.
+    cache: GlyphPathCache,
 }
 
-/// Render top/bottom annotated text into `final_path`.
-#[allow(clippy::too_many_arguments)]
-pub fn render_top_bottom(
-    final_path: &mut BezPath,
-    glyph_paths: GlyphPaths,
-    text_widths: &[f64],
-    p_scale_factor: f64,
-    main_upem: f64,
-    orig_advance: f64,
-    position: RubyPosition,
-    gutter_em: f64,
-    baseline_offset_em: f64,
-    tight: bool,
-    cached_top: &AtomicF64,
-    cached_bottom: &AtomicF64,
-    mut get_adv: impl FnMut(GlyphId) -> f64,
-) {
-    let total_width = text_widths.iter().sum::<f64>();
+impl<'a> RubyPainter<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        font: FontRef<'a>,
+        scale_ratio: f64,
+        gutter_em: f64,
+        position: RubyPosition,
+        baseline_offset_em: f64,
+        fit: bool,
+        fit_floor: f64,
+        tight: bool,
+    ) -> anyhow::Result<Self> {
+        let upem = font.head()?.units_per_em() as f64;
 
-    let bbox = final_path.bounding_box();
-    let gutter_units = gutter_em * main_upem;
-    let approx_height = main_upem * (p_scale_factor * (1.0 / (p_scale_factor.max(0.00001)))) * 0.8; // conservative
+        Ok(Self {
+            font,
+            upem,
+            scale_ratio,
+            gutter_em,
+            baseline_offset_em,
+            position,
+            fit,
+            fit_floor,
+            tight,
+            cache: GlyphPathCache::default(),
+        })
+    }
 
-    let baseline_offset_units = baseline_offset_em * main_upem;
+    /// Scale factor from ruby font units to main font units.
+    pub fn scale_factor(&self, main_upem: f64) -> f64 {
+        (self.scale_ratio * main_upem) / self.upem
+    }
 
-    // Measure min/max y of the pinyin glyphs in unscaled font units
+    fn advance_of(&self, gid: GlyphId) -> f64 {
+        let Ok(hmtx) = self.font.hmtx() else {
+            return self.upem;
+        };
 
-    let mut min_y: f64 = f64::INFINITY;
-    let mut max_y: f64 = f64::NEG_INFINITY;
+        hmtx.h_metrics()
+            .get(gid.to_u32() as usize)
+            .map(|m| m.advance.get())
+            .unwrap_or(self.upem as u16) as f64
+    }
 
-    for (_pgid, p_path) in &glyph_paths {
-        for el in p_path.elements() {
-            match el {
-                kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => {
-                    min_y = min_y.min(p.y);
-                    max_y = max_y.max(p.y);
+    /// Collect glyph paths and advances for a text, plus the total width
+    /// (all in ruby font units).
+    pub fn collect(&self, text: &str) -> Option<(GlyphPaths, Vec<f64>, f64)> {
+        let paths = collect_glyph_paths(&self.font, text, &self.cache)?;
+        let mut widths = Vec::with_capacity(paths.len());
+        let mut total = 0.0;
+
+        for (pgid, _) in &paths {
+            let width = self.advance_of(*pgid);
+            total += width;
+            widths.push(width);
+        }
+
+        Some((paths, widths, total))
+    }
+
+    fn unscaled_extents(&self, paths: &GlyphPaths) -> (f64, f64) {
+        let mut min_y: f64 = f64::INFINITY;
+        let mut max_y: f64 = f64::NEG_INFINITY;
+
+        for (_pgid, p_path) in paths {
+            for el in p_path.elements() {
+                match el {
+                    kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => {
+                        min_y = min_y.min(p.y);
+                        max_y = max_y.max(p.y);
+                    }
+                    kurbo::PathEl::QuadTo(p1, p2) => {
+                        min_y = min_y.min(p1.y).min(p2.y);
+                        max_y = max_y.max(p1.y).max(p2.y);
+                    }
+                    kurbo::PathEl::CurveTo(p1, p2, p3) => {
+                        min_y = min_y.min(p1.y).min(p2.y).min(p3.y);
+                        max_y = max_y.max(p1.y).max(p2.y).max(p3.y);
+                    }
+                    kurbo::PathEl::ClosePath => {}
                 }
-                kurbo::PathEl::QuadTo(p1, p2) => {
-                    min_y = min_y.min(p1.y).min(p2.y);
-                    max_y = max_y.max(p1.y).max(p2.y);
-                }
-                kurbo::PathEl::CurveTo(p1, p2, p3) => {
-                    min_y = min_y.min(p1.y).min(p2.y).min(p3.y);
-                    max_y = max_y.max(p1.y).max(p2.y).max(p3.y);
-                }
-                kurbo::PathEl::ClosePath => {}
             }
         }
+
+        if !min_y.is_finite() {
+            min_y = 0.0;
+        }
+
+        if !max_y.is_finite() {
+            max_y = self.upem * 0.8;
+        }
+
+        (min_y, max_y)
     }
 
-    if !min_y.is_finite() {
-        min_y = 0.0;
+    /// Baseline targets required for drawing `text` over a base span.
+    pub fn required_targets(
+        &self,
+        text: &str,
+        base_top: f64,
+        base_bottom: f64,
+        main_upem: f64,
+    ) -> Option<BaselineTargets> {
+        if !matches!(self.position, RubyPosition::Top | RubyPosition::Bottom) || self.tight {
+            return None;
+        }
+
+        let (paths, _, _) = self.collect(text)?;
+        let (min_y, max_y) = self.unscaled_extents(&paths);
+
+        let p_scale = self.scale_factor(main_upem);
+        let gutter = self.gutter_em * main_upem;
+        let offset = self.baseline_offset_em * main_upem;
+        let min_y_scaled = min_y * p_scale;
+        let max_y_scaled = max_y * p_scale;
+
+        let mut targets = BaselineTargets::default();
+
+        match self.position {
+            RubyPosition::Top => {
+                targets.top = Some(base_top + gutter + offset - min_y_scaled);
+            }
+            RubyPosition::Bottom => {
+                targets.bottom = Some(base_bottom - gutter - offset - max_y_scaled);
+            }
+            _ => {}
+        }
+
+        Some(targets)
     }
-    if !max_y.is_finite() {
-        max_y = approx_height / p_scale_factor;
-    }
 
-    let min_y_scaled = min_y * p_scale_factor;
-    let max_y_scaled = max_y * p_scale_factor;
+    /// Draw `text` centered over the span at `span_x` with width `span_advance`.
+    pub fn draw(
+        &self,
+        text: &str,
+        final_path: &mut BezPath,
+        span_x: f64,
+        span_advance: f64,
+        main_upem: f64,
+        targets: &BaselineTargets,
+    ) -> bool {
+        let Some((paths, _widths, total_width)) = self.collect(text) else {
+            return false;
+        };
 
-    let required_top_target = bbox.y1 + gutter_units + baseline_offset_units - min_y_scaled;
-    let required_bottom_target = bbox.y0 - gutter_units - baseline_offset_units - max_y_scaled;
-
-    let target_y = if tight {
-        if position == RubyPosition::Top {
-            bbox.y1 + gutter_units
+        if matches!(self.position, RubyPosition::Top | RubyPosition::Bottom) {
+            self.draw_top_bottom(
+                paths,
+                final_path,
+                span_x,
+                span_advance,
+                main_upem,
+                total_width,
+                targets,
+            );
         } else {
-            bbox.y0 - gutter_units - approx_height
+            self.draw_side(paths, final_path, span_advance, main_upem);
         }
-    } else {
-        if position == RubyPosition::Top {
-            cached_top
-                .fetch_max(required_top_target, Ordering::Relaxed)
-                .max(required_top_target)
-        } else {
-            cached_bottom
-                .fetch_min(required_bottom_target, Ordering::Relaxed)
-                .min(required_bottom_target)
+
+        true
+    }
+
+    /// Horizontal scale applied to the ruby text to make it fit its span.
+    fn x_scale(&self, total_width: f64, span_advance: f64) -> f64 {
+        if !self.fit || span_advance <= 0.0 || total_width <= span_advance {
+            return 1.0;
         }
-    };
 
-    let mut current_x = (orig_advance - total_width) / 2.0;
+        (span_advance / total_width).max(self.fit_floor.min(1.0))
+    }
 
-    for (pgid, mut p_path) in glyph_paths.into_iter() {
-        let xform =
-            kurbo::Affine::translate((current_x, target_y)) * kurbo::Affine::scale(p_scale_factor);
+    #[allow(clippy::too_many_arguments)]
+    fn draw_top_bottom(
+        &self,
+        paths: GlyphPaths,
+        final_path: &mut BezPath,
+        span_x: f64,
+        span_advance: f64,
+        main_upem: f64,
+        total_width: f64,
+        targets: &BaselineTargets,
+    ) {
+        let p_scale = self.scale_factor(main_upem);
+        let total_width_units = total_width * p_scale;
+        let x_scale = self.x_scale(total_width_units, span_advance);
 
-        p_path.apply_affine(xform);
+        let base_top = final_path.bounding_box().y1;
+        let base_bottom = final_path.bounding_box().y0;
 
-        for el in p_path.elements() {
-            match el {
-                kurbo::PathEl::MoveTo(p) => final_path.move_to(*p),
-                kurbo::PathEl::LineTo(p) => final_path.line_to(*p),
-                kurbo::PathEl::QuadTo(p1, p2) => final_path.quad_to(*p1, *p2),
-                kurbo::PathEl::CurveTo(p1, p2, p3) => final_path.curve_to(*p1, *p2, *p3),
-                kurbo::PathEl::ClosePath => final_path.close_path(),
+        let target_y = match self.position {
+            RubyPosition::Top => targets.top.unwrap_or_else(|| {
+                self.required_targets_of(&paths, p_scale, main_upem, base_top, base_bottom)
+                    .top
+                    .unwrap_or(base_top)
+            }),
+            RubyPosition::Bottom => targets.bottom.unwrap_or_else(|| {
+                self.required_targets_of(&paths, p_scale, main_upem, base_top, base_bottom)
+                    .bottom
+                    .unwrap_or(base_bottom)
+            }),
+            _ => return,
+        };
+
+        let mut current_x = span_x + (span_advance - total_width_units * x_scale) / 2.0;
+
+        for (pgid, mut p_path) in paths.into_iter() {
+            let xform = Affine::translate((current_x, target_y))
+                * Affine::scale_non_uniform(p_scale * x_scale, p_scale);
+
+            p_path.apply_affine(xform);
+
+            for el in p_path.elements() {
+                match el {
+                    kurbo::PathEl::MoveTo(p) => final_path.move_to(*p),
+                    kurbo::PathEl::LineTo(p) => final_path.line_to(*p),
+                    kurbo::PathEl::QuadTo(p1, p2) => final_path.quad_to(*p1, *p2),
+                    kurbo::PathEl::CurveTo(p1, p2, p3) => final_path.curve_to(*p1, *p2, *p3),
+                    kurbo::PathEl::ClosePath => final_path.close_path(),
+                }
             }
+
+            current_x += self.advance_of(pgid) * p_scale * x_scale;
         }
-
-        let adv = get_adv(pgid);
-        current_x += adv * p_scale_factor;
-    }
-}
-
-/// Render side-positioned annotations (left/right, up/down stacking)
-#[allow(clippy::too_many_arguments)]
-pub fn render_side(
-    final_path: &mut BezPath,
-    glyph_paths: &GlyphPaths,
-    p_scale_factor: f64,
-    main_upem: f64,
-    orig_advance: f64,
-    position: RubyPosition,
-    gutter_em: f64,
-    bbox_center_y: f64,
-    get_adv: &mut impl FnMut(GlyphId) -> f64,
-) {
-    let mut glyph_list: Vec<(f64, BezPath)> = Vec::new();
-
-    for (pgid, p_path) in glyph_paths {
-        let adv = get_adv(*pgid);
-        glyph_list.push((adv * p_scale_factor, p_path.clone()));
     }
 
-    if glyph_list.is_empty() {
-        return;
-    }
+    fn required_targets_of(
+        &self,
+        paths: &GlyphPaths,
+        p_scale: f64,
+        main_upem: f64,
+        base_top: f64,
+        base_bottom: f64,
+    ) -> BaselineTargets {
+        let (min_y, max_y) = self.unscaled_extents(paths);
+        let gutter = self.gutter_em * main_upem;
+        let offset = self.baseline_offset_em * main_upem;
+        let mut targets = BaselineTargets::default();
 
-    let max_glyph_width = glyph_list.iter().map(|(w, _)| *w).fold(0.0f64, f64::max);
-    let vertical_step = main_upem * p_scale_factor * 0.8;
-    let gutter_units = gutter_em * main_upem;
-
-    let start_x = match position {
-        RubyPosition::LeftDown | RubyPosition::LeftUp => -(max_glyph_width + gutter_units),
-        _ => orig_advance + gutter_units,
-    };
-
-    let n = glyph_list.len() as f64;
-    let mut current_y = match position {
-        RubyPosition::LeftDown | RubyPosition::RightDown => {
-            bbox_center_y + ((n - 1.0) / 2.0) * vertical_step
-        }
-        _ => bbox_center_y - ((n - 1.0) / 2.0) * vertical_step,
-    };
-
-    for (w, mut p_path) in glyph_list {
-        let tx = start_x + (max_glyph_width - w) / 2.0;
-
-        let xform =
-            kurbo::Affine::translate((tx, current_y)) * kurbo::Affine::scale(p_scale_factor);
-
-        p_path.apply_affine(xform);
-
-        for el in p_path.elements() {
-            match el {
-                kurbo::PathEl::MoveTo(p) => final_path.move_to(*p),
-                kurbo::PathEl::LineTo(p) => final_path.line_to(*p),
-                kurbo::PathEl::QuadTo(p1, p2) => final_path.quad_to(*p1, *p2),
-                kurbo::PathEl::CurveTo(p1, p2, p3) => final_path.curve_to(*p1, *p2, *p3),
-                kurbo::PathEl::ClosePath => final_path.close_path(),
+        match self.position {
+            RubyPosition::Top => {
+                targets.top = Some(base_top + gutter + offset - min_y * p_scale);
             }
+            RubyPosition::Bottom => {
+                targets.bottom = Some(base_bottom - gutter - offset - max_y * p_scale);
+            }
+            _ => {}
         }
 
-        match position {
-            RubyPosition::LeftDown | RubyPosition::RightDown => current_y -= vertical_step,
-            _ => current_y += vertical_step,
+        targets
+    }
+
+    /// Render side-positioned annotations (left/right, up/down stacking).
+    fn draw_side(
+        &self,
+        paths: GlyphPaths,
+        final_path: &mut BezPath,
+        orig_advance: f64,
+        main_upem: f64,
+    ) {
+        let p_scale = self.scale_factor(main_upem);
+
+        let mut glyph_list: Vec<(f64, BezPath)> = Vec::new();
+
+        for (pgid, p_path) in &paths {
+            glyph_list.push((self.advance_of(*pgid) * p_scale, p_path.clone()));
+        }
+
+        if glyph_list.is_empty() {
+            return;
+        }
+
+        let bbox = final_path.bounding_box();
+        let center_y = (bbox.y0 + bbox.y1) / 2.0;
+
+        let max_glyph_width = glyph_list.iter().map(|(w, _)| *w).fold(0.0f64, f64::max);
+        let vertical_step = main_upem * p_scale * 0.8;
+        let gutter_units = self.gutter_em * main_upem;
+
+        let start_x = match self.position {
+            RubyPosition::LeftDown | RubyPosition::LeftUp => -(max_glyph_width + gutter_units),
+            _ => orig_advance + gutter_units,
+        };
+
+        let n = glyph_list.len() as f64;
+        let mut current_y = match self.position {
+            RubyPosition::LeftDown | RubyPosition::RightDown => {
+                center_y + ((n - 1.0) / 2.0) * vertical_step
+            }
+            _ => center_y - ((n - 1.0) / 2.0) * vertical_step,
+        };
+
+        for (w, mut p_path) in glyph_list {
+            let tx = start_x + (max_glyph_width - w) / 2.0;
+
+            let xform = Affine::translate((tx, current_y)) * Affine::scale(p_scale);
+
+            p_path.apply_affine(xform);
+
+            for el in p_path.elements() {
+                match el {
+                    kurbo::PathEl::MoveTo(p) => final_path.move_to(*p),
+                    kurbo::PathEl::LineTo(p) => final_path.line_to(*p),
+                    kurbo::PathEl::QuadTo(p1, p2) => final_path.quad_to(*p1, *p2),
+                    kurbo::PathEl::CurveTo(p1, p2, p3) => final_path.curve_to(*p1, *p2, *p3),
+                    kurbo::PathEl::ClosePath => final_path.close_path(),
+                }
+            }
+
+            match self.position {
+                RubyPosition::LeftDown | RubyPosition::RightDown => current_y -= vertical_step,
+                _ => current_y += vertical_step,
+            }
         }
     }
 }
