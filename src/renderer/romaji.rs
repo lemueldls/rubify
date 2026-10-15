@@ -1,149 +1,369 @@
-use anyhow::{Context, Result};
-use atomic_float::AtomicF64;
-use fontcull_read_fonts::{FontRef, TableProvider};
-use kurbo::{BezPath, Shape};
-use wana_kana::ConvertJapanese;
+use std::ops::RangeInclusive;
 
-use super::{CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition, RubyRenderer, utils};
+use anyhow::Result;
+use fontcull_read_fonts::FontRef;
+use kurbo::BezPath;
+
+use super::{
+    BaselineTargets, CJK_EXT_A_RANGE, CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE, RubyPosition,
+    RubyRenderer, hiragana::to_hiragana, utils::RubyPainter,
+};
+
+/// Single kana to romaji, in modified Hepburn. Yōon, sokuon and long vowels
+/// are handled by [`to_hepburn`], which needs the rest of the word.
+fn kana_to_romaji(c: char) -> Option<&'static str> {
+    Some(match c {
+        'あ' => "a",
+        'い' => "i",
+        'う' => "u",
+        'え' => "e",
+        'お' => "o",
+        'か' => "ka",
+        'き' => "ki",
+        'く' => "ku",
+        'け' => "ke",
+        'こ' => "ko",
+        'が' => "ga",
+        'ぎ' => "gi",
+        'ぐ' => "gu",
+        'げ' => "ge",
+        'ご' => "go",
+        'さ' => "sa",
+        'し' => "shi",
+        'す' => "su",
+        'せ' => "se",
+        'そ' => "so",
+        'ざ' => "za",
+        'じ' => "ji",
+        'ず' => "zu",
+        'ぜ' => "ze",
+        'ぞ' => "zo",
+        'た' => "ta",
+        'ち' => "chi",
+        'つ' => "tsu",
+        'て' => "te",
+        'と' => "to",
+        'だ' => "da",
+        'ぢ' => "ji",
+        'づ' => "zu",
+        'で' => "de",
+        'ど' => "do",
+        'な' => "na",
+        'に' => "ni",
+        'ぬ' => "nu",
+        'ね' => "ne",
+        'の' => "no",
+        'は' => "ha",
+        'ひ' => "hi",
+        'ふ' => "fu",
+        'へ' => "he",
+        'ほ' => "ho",
+        'ば' => "ba",
+        'び' => "bi",
+        'ぶ' => "bu",
+        'べ' => "be",
+        'ぼ' => "bo",
+        'ぱ' => "pa",
+        'ぴ' => "pi",
+        'ぷ' => "pu",
+        'ぺ' => "pe",
+        'ぽ' => "po",
+        'ま' => "ma",
+        'み' => "mi",
+        'む' => "mu",
+        'め' => "me",
+        'も' => "mo",
+        'や' => "ya",
+        'ゆ' => "yu",
+        'よ' => "yo",
+        'ら' => "ra",
+        'り' => "ri",
+        'る' => "ru",
+        'れ' => "re",
+        'ろ' => "ro",
+        'わ' => "wa",
+        'ゐ' => "i",
+        'ゑ' => "e",
+        'を' => "o",
+        'ゔ' => "vu",
+        'ぁ' => "a",
+        'ぃ' => "i",
+        'ぅ' => "u",
+        'ぇ' => "e",
+        'ぉ' => "o",
+        'ゃ' => "ya",
+        'ゅ' => "yu",
+        'ょ' => "yo",
+        'ゎ' => "wa",
+        _ => return None,
+    })
+}
+
+fn yoon(c: char) -> Option<&'static str> {
+    Some(match c {
+        'ゃ' => "a",
+        'ゅ' => "u",
+        'ょ' => "o",
+        _ => return None,
+    })
+}
+
+struct Syllable {
+    kana: String,
+    romaji: String,
+}
+
+fn syllables(kana: &str) -> Vec<Syllable> {
+    let chars: Vec<char> = kana.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let small = chars.get(i + 1).copied().and_then(yoon);
+        let base = kana_to_romaji(c);
+
+        if let (Some(small), Some(base)) = (small, base)
+            && base.len() > 1
+            && base.ends_with('i')
+        {
+            // きゃ -> kya, しゃ -> sha, ちゃ -> cha, じゃ -> ja
+            let stem = &base[..base.len() - 1];
+            let romaji = if stem.ends_with("sh") || stem.ends_with("ch") || stem.ends_with('j') {
+                format!("{stem}{small}")
+            } else {
+                format!("{stem}y{small}")
+            };
+            out.push(Syllable {
+                kana: format!("{c}{}", chars[i + 1]),
+                romaji,
+            });
+            i += 2;
+            continue;
+        }
+
+        out.push(Syllable {
+            kana: c.to_string(),
+            romaji: base.map(str::to_string).unwrap_or_else(|| c.to_string()),
+        });
+        i += 1;
+    }
+
+    out
+}
+
+fn doubled(next: &str) -> &str {
+    if next.starts_with("ch") {
+        return "t";
+    }
+
+    let mut chars = next.chars();
+    match chars.next() {
+        Some(c) if !"aeiou".contains(c) && c.is_alphanumeric() => &next[..c.len_utf8()],
+        _ => "",
+    }
+}
+
+/// Folds a long vowel into a macron: おう and おお give ō, うう gives ū.
+fn lengthen(out: &mut String, kana: &str) -> bool {
+    if (kana == "う" && (out.ends_with('o') || out.ends_with('u')))
+        || (kana == "お" && out.ends_with('o'))
+    {
+        let last = out.pop().unwrap();
+        out.push(if last == 'u' { 'ū' } else { 'ō' });
+        return true;
+    }
+
+    false
+}
+
+/// The prolonged sound mark ー lengthens the vowel before it (コーヒー -> kōhī).
+fn prolong(out: &mut String) -> bool {
+    let Some(last) = out.chars().last() else {
+        return false;
+    };
+
+    let marked = match last {
+        'a' => 'ā',
+        'i' => 'ī',
+        'u' => 'ū',
+        'e' => 'ē',
+        'o' => 'ō',
+        _ => return false,
+    };
+
+    out.pop();
+    out.push(marked);
+    true
+}
+
+/// Modified Hepburn with macrons (きょう -> kyō, おおきい -> ōkii).
+///
+/// `following` is the kana written after this reading in the same word, so a
+/// trailing っ can double the next syllable's consonant (がっ before こう ->
+/// gak).
+pub fn to_hepburn(reading: &str, following: &str) -> String {
+    let kana = to_hiragana(reading);
+    let following = to_hiragana(following);
+    let parts = syllables(&kana);
+    let after: Vec<Syllable> = parts
+        .iter()
+        .map(|s| Syllable {
+            kana: s.kana.clone(),
+            romaji: s.romaji.clone(),
+        })
+        .chain(syllables(&following))
+        .collect();
+
+    let mut out = String::new();
+
+    for (i, part) in parts.iter().enumerate() {
+        let next = after[i + 1..]
+            .iter()
+            .find(|s| s.kana != "っ")
+            .map(|s| s.romaji.as_str())
+            .unwrap_or("");
+
+        if part.kana == "っ" {
+            out.push_str(doubled(next));
+        } else if part.kana == "ー" {
+            prolong(&mut out);
+        } else if part.kana == "ん" {
+            // n' before a vowel or y, so んい stays one syllable.
+            let vowel_next = next.starts_with(['a', 'e', 'i', 'o', 'u', 'y']);
+            let more = i + 1 < parts.len();
+            out.push('n');
+            if more && vowel_next {
+                out.push('\'');
+            }
+        } else if !lengthen(&mut out, &part.kana) {
+            out.push_str(&part.romaji);
+        }
+    }
+
+    out
+}
 
 pub struct RomajiRenderer<'a> {
-    /// reference for the ruby font
-    font: FontRef<'a>,
-    /// Units per em of the ruby font
-    upem: f64,
-    /// fraction of main font size to use for the ruby font (e.g. 0.7 = 70%)
-    scale_ratio: f64,
-    /// Gap (in em units) between the base glyph and the ruby text
-    gutter_em: f64,
-    /// Position of the ruby relative to the base glyph
-    position: RubyPosition,
-    /// Baseline offset in em units to fine tune annotation baseline
-    baseline_offset_em: f64,
-    /// When true, use tight placement; otherwise a consistent baseline is used
-    tight: bool,
-    /// Cached consistent top target y (in main font units), computed lazily when placing Top annotations
-    cached_top_target: AtomicF64,
-    /// Cached consistent bottom target y (in main font units), computed lazily when placing Bottom annotations
-    cached_bottom_target: AtomicF64,
-    /// Cache of drawn ruby glyph paths, keyed by character
-    path_cache: utils::GlyphPathCache,
+    painter: RubyPainter<'a>,
 }
 
 impl<'a> RomajiRenderer<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         font: FontRef<'a>,
         scale_ratio: f64,
         gutter_em: f64,
         position: RubyPosition,
         baseline_offset_em: f64,
+        fit: bool,
+        fit_floor: f64,
         tight: bool,
     ) -> Result<Self> {
-        let upem = font.head()?.units_per_em() as f64;
-
         Ok(Self {
-            font,
-            upem,
-            scale_ratio,
-            gutter_em,
-            position,
-            baseline_offset_em,
-            tight,
-            cached_top_target: AtomicF64::new(f64::NEG_INFINITY),
-            cached_bottom_target: AtomicF64::new(f64::INFINITY),
-            path_cache: utils::GlyphPathCache::default(),
+            painter: RubyPainter::new(
+                font,
+                scale_ratio,
+                gutter_em,
+                position,
+                baseline_offset_em,
+                fit,
+                fit_floor,
+                tight,
+            )?,
         })
     }
 }
 
-impl<'a> RubyRenderer for RomajiRenderer<'a> {
-    fn annotate(
-        &self,
-        ch: char,
-        final_path: &mut BezPath,
-        orig_advance: f64,
-        main_upem: f64,
-    ) -> Result<()> {
-        let kana = ch.to_string();
+/// Whether a character can be part of a kana reading.
+fn is_kana(c: char) -> bool {
+    let cp = c as u32;
+    (0x3040..=0x30ff).contains(&cp)
+}
 
-        let romaji_text = kana.to_romaji();
-        if romaji_text.is_empty() || kana == romaji_text || romaji_text == "-" {
-            return Ok(());
+impl RubyRenderer for RomajiRenderer<'_> {
+    fn reading_for(&self, ch: char) -> Option<String> {
+        if is_kana(ch) {
+            Some(ch.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn prepare_text(&self, reading: &str, following: &str) -> Option<String> {
+        if reading.is_empty() {
+            return None;
         }
 
-        let hmtx = self.font.hmtx().context("Missing romaji font hmtx")?;
+        let romaji = to_hepburn(reading, following);
 
-        let glyph_paths =
-            match utils::collect_glyph_paths(&self.font, romaji_text, &self.path_cache) {
-                Some(p) => p,
-                None => return Ok(()),
-            };
+        if romaji.is_empty() || romaji == reading {
+            None
+        } else {
+            Some(romaji)
+        }
+    }
 
-        let p_scale_factor = (self.scale_ratio * main_upem) / self.upem;
+    fn required_targets(
+        &self,
+        reading: &str,
+        following: &str,
+        base_top: f64,
+        base_bottom: f64,
+        main_upem: f64,
+    ) -> Result<BaselineTargets> {
+        let Some(text) = self.prepare_text(reading, following) else {
+            return Ok(BaselineTargets::default());
+        };
 
-        let parts_widths = utils::compute_glyph_widths(
-            &glyph_paths,
-            p_scale_factor,
-            |pgid: fontcull_skrifa::GlyphId| {
-                hmtx.h_metrics()
-                    .get(pgid.to_u32() as usize)
-                    .map(|m| m.advance.get())
-                    .unwrap_or(self.upem as u16) as f64
-            },
-        );
+        Ok(self
+            .painter
+            .required_targets(&text, base_top, base_bottom, main_upem)
+            .unwrap_or_default())
+    }
 
-        match self.position {
-            RubyPosition::Top | RubyPosition::Bottom => {
-                utils::render_top_bottom(
-                    final_path,
-                    glyph_paths,
-                    &parts_widths,
-                    p_scale_factor,
-                    main_upem,
-                    orig_advance,
-                    self.position,
-                    self.gutter_em,
-                    self.baseline_offset_em,
-                    self.tight,
-                    &self.cached_top_target,
-                    &self.cached_bottom_target,
-                    |pgid: fontcull_skrifa::GlyphId| {
-                        hmtx.h_metrics()
-                            .get(pgid.to_u32() as usize)
-                            .map(|m| m.advance.get())
-                            .unwrap_or(self.upem as u16) as f64
-                    },
-                );
-            }
-            RubyPosition::LeftDown
-            | RubyPosition::LeftUp
-            | RubyPosition::RightDown
-            | RubyPosition::RightUp => {
-                let bbox = final_path.bounding_box();
-                let center_y = (bbox.y0 + bbox.y1) / 2.0;
-
-                utils::render_side(
-                    final_path,
-                    &glyph_paths,
-                    p_scale_factor,
-                    main_upem,
-                    orig_advance,
-                    self.position,
-                    self.gutter_em,
-                    center_y,
-                    &mut |pgid: fontcull_skrifa::GlyphId| {
-                        hmtx.h_metrics()
-                            .get(pgid.to_u32() as usize)
-                            .map(|m| m.advance.get())
-                            .unwrap_or(self.upem as u16) as f64
-                    },
-                );
-            }
+    fn draw_reading(
+        &self,
+        reading: &str,
+        following: &str,
+        final_path: &mut BezPath,
+        span_x: f64,
+        span_advance: f64,
+        main_upem: f64,
+        targets: &BaselineTargets,
+    ) -> Result<()> {
+        if let Some(text) = self.prepare_text(reading, following) {
+            self.painter
+                .draw(&text, final_path, span_x, span_advance, main_upem, targets);
         }
 
         Ok(())
     }
 
-    fn ranges(&self) -> &[std::ops::RangeInclusive<u32>] {
-        &[CJK_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE]
+    fn can_draw_text(&self, text: &str) -> bool {
+        self.painter.collect(text).is_some()
+    }
+
+    fn ranges(&self) -> &[RangeInclusive<u32>] {
+        &[CJK_RANGE, CJK_EXT_A_RANGE, HIRAGANA_RANGE, KATAKANA_RANGE]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_hepburn;
+
+    #[test]
+    fn word_readings() {
+        assert_eq!(to_hepburn("きょう", ""), "kyō");
+        assert_eq!(to_hepburn("がっ", "こう"), "gak");
+        assert_eq!(to_hepburn("こう", ""), "kō");
+        assert_eq!(to_hepburn("おとな", ""), "otona");
+        assert_eq!(to_hepburn("にほん", ""), "nihon");
+        assert_eq!(to_hepburn("しゅっ", "たい"), "shut");
+        assert_eq!(to_hepburn("あした", ""), "ashita");
+        assert_eq!(to_hepburn("ローマじ", ""), "rōmaji");
+        assert_eq!(to_hepburn("しんぶん", ""), "shinbun");
+        assert_eq!(to_hepburn("まっ", "ちゃ"), "mat");
     }
 }
