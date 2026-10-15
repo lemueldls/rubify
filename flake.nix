@@ -22,7 +22,13 @@
         craneLib = crane.mkLib pkgs;
 
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              (pkgs.lib.fileset.maybeMissing ./data)
+            ];
+          };
           strictDeps = true;
           meta.mainProgram = "rubify";
         };
