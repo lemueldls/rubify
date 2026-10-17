@@ -2,6 +2,8 @@
 
 > Annotate fonts with ruby (pinyin/romaji/hiragana) and produce modified TTF/WOFF2 outputs.
 
+![Example](example.png)
+
 - Render ruby annotations using pluggable renderers (`pinyin`, `romaji`, `hiragana`)
 - Word-level readings through bundled dictionaries, compiled into ligature and
   contextual rules, so 日本 reads にほん and 今日
@@ -69,55 +71,11 @@ rubify *.ttc -o dist --font iosevka/IosevkaSlim-Regular.ttf --ruby romaji --posi
 rubify NotoSansJP-Regular.ttf -o dist --ruby hiragana --common-only
 ```
 
-![Example](example.png)
+## Fonts made with Rubify
 
-## Word annotations
-
-With a dictionary (bundled by default) or `--words`, rubify annotates whole
-words rather than characters. Each word reading is drawn over the word and
-made reachable with GSUB ligature and contextual rules under `liga` and
-`rclt`, both enabled by default in browsers and shapers:
-
-- 日本 reads にほん / nihon as a word, not 日 (ひ) + 本 (もと)
-- 今日 reads きょう / kyō, not ki + yo + u
-- 学校 reads がっこう / gak + kō, sokuon included
-- Curated defaults win where the data ranks wrong (出来 is でき, not しゅったい)
-
-A font only ever sees one run of characters at a time, so words that mix kanji
-and kana (食べる) cannot be matched by any font and are skipped. Per-character
-annotations remain the fallback for text no word matches.
-
-Bundled data is CC BY-SA 4.0; see [data/LICENSE.md](data/LICENSE.md) and
-`--no-dict`/`--dict` to avoid or replace it. The JA dictionary comes from
-furifont's compiled JMdict data; the ZH dictionary from CC-CEDICT.
-
-Ruby is drawn above the base glyphs and can be clipped by tight line spacing;
-set `line-height` to about 1.6 in the application, or use `--adjust-metrics`.
-
-A variable font is flattened to its default instance: rubify re-encodes the
-glyphs it annotates, so the font's variation data (`gvar`, `HVAR`, `VVAR`) is
-dropped with a warning.
-
-## Fonts made with rubify
-
-Typefaces that ship rubify-generated annotations:
+Typefaces that ship Rubify-generated annotations:
 
 - [Asterism Ruby](https://lem.my/fonts/asterism-ruby)
-
-## Development
-
-`example.png` is generated, not hand-drawn. `cargo xtask example` downloads a
-pinned font, subsets it to the specimen, runs the annotation pipeline over it
-and rasterizes the result:
-
-```sh
-cargo xtask example
-```
-
-The specimen (text, ruby sets and word readings) lives in
-`xtask/src/example.rs`; it renders with
-[LXGW WenKai](https://github.com/lxgw/LxgwWenKai) (SIL Open Font License 1.1).
-The bundled dictionaries are rebuilt separately with `cargo xtask update-dict`.
 
 ## License
 
@@ -128,5 +86,4 @@ Licensed under either of
 
 at your option.
 
-The bundled dictionaries are licensed under CC BY-SA 4.0, see
-[data/LICENSE.md](data/LICENSE.md).
+The bundled dictionaries are licensed under CC BY-SA 4.0, see [data/LICENSE.md](data/LICENSE.md).
